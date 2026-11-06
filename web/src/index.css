@@ -1,0 +1,186 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --app-bg: #f8fafc;
+  --app-card-bg: #ffffff;
+  --app-border: #e2e8f0;
+  --app-text: #0f172a;
+  --app-text-muted: #64748b;
+  --app-primary: #2563eb;
+}
+
+[data-theme='dark'] {
+  --app-bg: #0b0f19;
+  --app-card-bg: #111827;
+  --app-border: #1f2937;
+  --app-text: #f8fafc;
+  --app-text-muted: #94a3b8;
+  --app-primary: #3b82f6;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background-color: var(--app-bg);
+  color: var(--app-text);
+  font-family: 'Figtree', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Badge styles */
+.badge-flash {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+}
+.badge-flash-n {
+  background: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+}
+.badge-flash-exp-a {
+  background: #f5f3ff;
+  color: #6d28d9;
+  border: 1px solid #ddd6fe;
+}
+.badge-flash-exp-b {
+  background: #fffbeb;
+  color: #b45309;
+  border: 1px solid #fde68a;
+}
+.badge-claude {
+  background: #fff1f2;
+  color: #be123c;
+  border: 1px solid #fecdd3;
+}
+.badge-argon {
+  background: #eef2ff;
+  color: #4338ca;
+  border: 1px solid #c7d2fe;
+}
+.badge-unknown {
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+}
+
+/* Responsive Data Table */
+.table-wrapper {
+  overflow: auto;
+  max-inline-size: 100%;
+  max-block-size: min(760px, 78vh);
+  container-type: inline-size;
+  background: var(--app-card-bg);
+  border-radius: 14px;
+  border: 1px solid var(--app-border);
+}
+
+.sessions-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  text-align: left;
+  font-size: 13px;
+  --label-2: "命中路由端点";
+  --label-3: "推理次数";
+  --label-4: "输出速率 / TTFT";
+  --label-5: "Tokens 消耗";
+  --label-6: "最后活动时间";
+  --label-7: "操作";
+}
+
+.sessions-table thead {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 2;
+}
+
+.sessions-table thead th {
+  background: #f8fafc;
+  border-bottom: 1px solid var(--app-border);
+  color: var(--app-text-muted);
+  padding: 12px 18px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sessions-table tbody th {
+  position: sticky;
+  inset-inline-start: 0;
+  z-index: 1;
+  background: var(--app-card-bg);
+  font-weight: 400;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--app-border);
+  transition: background-color 0.15s;
+}
+
+.sessions-table tbody td {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--app-border);
+  background: var(--app-card-bg);
+  transition: background-color 0.15s;
+}
+
+.sessions-table tbody tr:hover th,
+.sessions-table tbody tr:hover td {
+  background-color: #f8fafc;
+}
+
+@container (width < 760px) {
+  .sessions-table,
+  .sessions-table thead,
+  .sessions-table tbody,
+  .sessions-table tr,
+  .sessions-table th,
+  .sessions-table td {
+    display: block;
+  }
+
+  .sessions-table thead {
+    display: none;
+  }
+
+  .sessions-table tbody tr {
+    margin: 12px;
+    border: 1px solid var(--app-border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  .sessions-table tbody th {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 2;
+    background: #f8fafc;
+  }
+
+  .sessions-table td::before {
+    font-weight: 600;
+    color: var(--app-text-muted);
+    margin-inline-end: 6px;
+  }
+
+  .sessions-table td:nth-child(2)::before { content: var(--label-2) ": "; }
+  .sessions-table td:nth-child(3)::before { content: var(--label-3) ": "; }
+  .sessions-table td:nth-child(4)::before { content: var(--label-4) ": "; }
+  .sessions-table td:nth-child(5)::before { content: var(--label-5) ": "; }
+  .sessions-table td:nth-child(6)::before { content: var(--label-6) ": "; }
+  .sessions-table td:nth-child(7)::before { content: var(--label-7) ": "; }
+}
+
+/* Custom Modal Backdrop */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}

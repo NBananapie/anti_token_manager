@@ -1,0 +1,5 @@
+# Antigravity Token Manager Python Requirements
+#
+# All core scripts (analyze_tokens.py, report_daily_tokens.py, manage_token_limit.py, analyze_compact.py)
+# are implemented using Python standard libraries (sqlite3, json, pathlib, argparse, datetime, urllib, re).
+# Python >= 3.10 is recommended. No additional pip dependencies are strictly required.

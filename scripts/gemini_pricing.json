@@ -1,0 +1,68 @@
+{
+  "gemini-3.8-flash": {
+    "name": "Gemini 3.8 Flash (High)",
+    "input": 0.75,
+    "cache_read": 0.075,
+    "output": 3.75
+  },
+  "gemini-3.8-flash-2027": {
+    "name": "Gemini 3.8 Flash (2027 Standard)",
+    "input": 1.5,
+    "cache_read": 0.15,
+    "output": 7.5
+  },
+  "gemini-4-argon": {
+    "name": "Gemini 4 Argon (High)",
+    "input": 2.0,
+    "cache_read": 0.1,
+    "output": 10.0
+  },
+  "gemini-3.5-flash-lite": {
+    "name": "Gemini 3.5 Flash-Lite",
+    "input": 0.3,
+    "cache_read": 0.03,
+    "output": 2.5
+  },
+  "gemini-3.1-pro": {
+    "name": "Gemini 3.1 Pro",
+    "input": 2.0,
+    "cache_read": 0.2,
+    "output": 12.0
+  },
+  "claude-opus-5-5": {
+    "name": "Claude Opus 5.5 (High)",
+    "input": 4.0,
+    "cache_read": 0.2,
+    "output": 20.0
+  },
+  "claude-sonnet-5-5": {
+    "name": "Claude Sonnet 5.5 (High)",
+    "input": 2.0,
+    "cache_read": 0.1,
+    "output": 10.0
+  },
+  "claude-opus-4-6": {
+    "name": "Claude Opus 4.6",
+    "input": 5.0,
+    "cache_read": 0.5,
+    "output": 25.0
+  },
+  "claude-opus-4": {
+    "name": "Claude Opus 4",
+    "input": 15.0,
+    "cache_read": 1.5,
+    "output": 75.0
+  },
+  "claude-sonnet-4.6": {
+    "name": "Claude Sonnet 4.6 (Thinking)",
+    "input": 3.0,
+    "cache_read": 0.3,
+    "output": 15.0
+  },
+  "claude-haiku-4-5": {
+    "name": "Claude Haiku 4.5",
+    "input": 1.0,
+    "cache_read": 0.1,
+    "output": 5.0
+  }
+}

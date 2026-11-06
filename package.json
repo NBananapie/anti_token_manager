@@ -1,0 +1,24 @@
+{
+  "name": "anti-token-manager",
+  "version": "1.0.0",
+  "description": "Antigravity Token Consumption Auditing & Real-time Model Monitor",
+  "type": "module",
+  "scripts": {
+    "dev": "npm --prefix web run dev",
+    "build": "npm --prefix web run build",
+    "start": "node web/server.js",
+    "report": "python scripts/report_daily_tokens.py",
+    "analyze": "python scripts/analyze_tokens.py"
+  },
+  "keywords": [
+    "antigravity",
+    "gemini",
+    "claude",
+    "token-monitoring",
+    "tps",
+    "ttft",
+    "context-window"
+  ],
+  "author": "NBananapie",
+  "license": "MIT"
+}
