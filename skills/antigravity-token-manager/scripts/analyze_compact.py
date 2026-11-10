@@ -189,19 +189,78 @@ def print_report(stats: dict[str, dict[str, list[Any]]]) -> None:
 
     print("\n" + line_sep)
     print("[Engineering Insights & Threshold Rules]")
-    print("1. Compaction triggers at a hard threshold based on instant context window (input_tokens + cache_read_tokens).")
-    print("2. Default official limit: Flash series compaction triggers around ~108.8K tokens (85% watermark of 128K limit).")
-    print("3. With 256K patch: Flash series compaction triggers around ~217.6K tokens (85% watermark of 256K limit).")
+    print("1. Compaction triggers immediately after instant context window (input_tokens + cache_read_tokens) crosses 100% of max_token_limit.")
+    print("2. Both Gemini 3.8 Flash and Gemini 4 Argon evaluate against the configured max_token_limit at step completion.")
+    print("3. For 1M context models (--set 1m / 840k), max_token_limit is 840,000 tokens (reserving 160K for MaxOutputTokens=65,536 and in-step tool growth).")
+    print("4. Supported binary patch tiers via manage_token_limit.py: 128K, 256K, 320K, 384K, 512K, 768K, and 1M (840K safe cap).")
     print(line_sep + "\n")
+
+
+def inspect_session_trajectory(conv_id: str, base_dir: str | None = None, as_json: bool = False) -> None:
+    """Print step-by-step context window progression and CHECKPOINT events for a single conversation."""
+    bdir = base_dir or DEFAULT_BASE_DIR
+    tf = os.path.join(bdir, "brain", conv_id, ".system_generated", "logs", "transcript.jsonl")
+    db_step_info = load_conversation_db_step_info(conv_id, bdir)
+
+    step_types: dict[int, str] = {}
+    if os.path.exists(tf):
+        with open(tf, "r", encoding="utf-8", errors="ignore") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    idx = obj.get("step_index")
+                    if idx is not None:
+                        step_types[int(idx)] = obj.get("type", "STEP")
+                except Exception:
+                    continue
+
+    all_indices = sorted(set(db_step_info.keys()) | {k for k, v in step_types.items() if v == "CHECKPOINT"})
+    rows: list[dict[str, Any]] = []
+    for idx in all_indices:
+        inp, cache, out, model = db_step_info.get(idx, (0, 0, 0, None))
+        ctx = inp + cache
+        stype = step_types.get(idx, "PLANNER_RESPONSE")
+        if ctx > 0 or stype == "CHECKPOINT":
+            rows.append(
+                {
+                    "step_index": idx,
+                    "type": stype,
+                    "ctx_tokens": ctx,
+                    "input_tokens": inp,
+                    "cache_read_tokens": cache,
+                    "output_tokens": out,
+                    "model": model,
+                }
+            )
+
+    if as_json:
+        print(json.dumps({"conversation_id": conv_id, "steps": rows}, indent=2, ensure_ascii=False))
+        return
+
+    print(f"Conversation: {conv_id}")
+    for r in rows:
+        print(
+            f"  Step {r['step_index']:3d} | {r['type']:16s} | "
+            f"ctx={r['ctx_tokens']:7,d} (inp={r['input_tokens']:7,d}, cache={r['cache_read_tokens']:7,d}, out={r['output_tokens']:5,d}) | "
+            f"model={r['model']}"
+        )
 
 
 def main() -> None:
     """CLI entry point for compact threshold analyzer."""
     parser = argparse.ArgumentParser(description="Antigravity Compact Threshold Analyzer CLI")
     parser.add_argument("--base-dir", help="Antigravity base data directory (default: ~/.gemini/antigravity)")
+    parser.add_argument("--session", help="Inspect step-by-step context trajectory and CHECKPOINT events for a specific conversation ID")
     parser.add_argument("--json", action="store_true", help="Output full JSON report")
 
     args = parser.parse_args()
+    if args.session:
+        inspect_session_trajectory(args.session, base_dir=args.base_dir, as_json=args.json)
+        return
+
     stats = analyze_compact_thresholds(base_dir=args.base_dir)
 
     if args.json:

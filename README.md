@@ -66,8 +66,10 @@ flowchart TD
 - 针对 Antigravity 派生的各类子代理（Subagents，如 `research`、`codebase-retriever`、`terminal` 等），自动化工具与 Web 大盘均支持通过 `parent_conversation_id` 进行递归穿透关联，避免遗漏后台子任务的资源消耗。
 
 ### 2.5 上下文窗口限制配置与压缩审计
-- 支持针对 `language_server` 进行上下文窗口上限配置（128K、256K、320K、384K、512K），并提供一键还原默认配置机制。
-- 自动捕捉模型在达到上下文水印时的截断压缩行为（`CHECKPOINT`），分析交互轮次、触发上下文量以及压缩缩减百分比。
+- 支持针对 `language_server` 进行上下文窗口上限配置（`128K`、`256K`、`320K`、`384K`、`512K`、`768K`、`1M`），并提供一键还原默认配置机制。
+- 深入底层 x86_64 机器码与 `.rdata` JSON 插槽，解除 Cloud MendelStateCache 云端覆盖与 5 处机器码截断钳制（Clamp），适配 1M 窗口下 Google 官方 `claude-1m_840k` 标准（840K 安全上限，保留 160K 空间用于工具输出扩展与检查点生成）。
+- 支持跨平台原子写入机制，在 Windows 上即使 `language_server` 处于运行状态，亦可通过原子重命名无损完成二进制热配置。
+- 自动捕捉模型在达到上下文水印时的截断压缩行为（`CHECKPOINT`），分析交互轮次、触发上下文量以及压缩缩减百分比，支持 `--session` 逐步上下文轨迹分析。
 
 ---
 
@@ -178,32 +180,36 @@ python scripts/report_daily_tokens.py --weekly
 
 ### 5.3 上下文压缩行为分析 (`analyze_compact.py`)
 
-分析历史会话中模型触发 `CHECKPOINT` 上下文压缩的具体步数、压缩前 Token 量及缩减比例：
+分析历史会话中模型触发 `CHECKPOINT` 上下文压缩的具体步数、压缩前 Token 量及缩减比例，或钻取指定会话逐步轨迹：
 
 ```bash
+# 全局统计报告
 python scripts/analyze_compact.py
+
+# 钻取指定会话的逐步上下文轨迹与 CHECKPOINT 触发明细
+python scripts/analyze_compact.py --session <conversation-id>
 ```
 
 ### 5.4 语言服务上下文窗口配置 (`manage_token_limit.py`)
 
-修改或检查 `language_server` 运行时的上下文最大 Token 限制：
+修改或检查 `language_server` 运行时的上下文最大 Token 限制（支持 128K、256K、320K、384K、512K、768K、1M / 840K）：
 
 ```bash
-# 查看当前各模型上下文限制状态与触发水印
+# 1. 查看当前各模型上下文限制状态、机器码钳制与 Mendel 状态
 python scripts/manage_token_limit.py --status
 
-# 将全部模型窗口升级至 256K / 384K / 512K
-python scripts/manage_token_limit.py --set 256k
-python scripts/manage_token_limit.py --set 384k
+# 2. 将全部模型窗口升级至指定档位（例如 512K / 768K / 1M）
 python scripts/manage_token_limit.py --set 512k
+python scripts/manage_token_limit.py --set 768k
+python scripts/manage_token_limit.py --set 1m
 
-# 针对指定模型配置（例如仅将 Flash 系列设为 512K）
-python scripts/manage_token_limit.py --set 512k --model flash
+# 3. 针对指定模型独立配置（例如仅将 Argon 设为 1M）
+python scripts/manage_token_limit.py --set 1m --model argon
 
-# 恢复官方默认配置 (Flash 128K, Argon 256K)
+# 4. 恢复官方默认基线 (Flash 128K, Argon 256K, Clamp 256K, Cloud Mendel 生效)
 python scripts/manage_token_limit.py --restore
 ```
-> 注意：配置修改生效前，需完全退出并重启 Antigravity 应用程序。
+> 注意：配置修改后，需完全退出并重启 Antigravity 应用程序以使新的上下文水印与限制生效。
 
 ---
 

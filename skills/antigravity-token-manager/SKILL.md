@@ -5,7 +5,7 @@ description: 审计 Antigravity 会话 Token 消耗并核算 Gemini 与 Claude �
 
 # Antigravity Token & Context Manager
 
-Unified toolset to audit Antigravity local session token consumption, calculate Google Gemini and Anthropic Claude model costs (via SQLite `gen_metadata` and `steps` ground-truth attribution), measure conversation output speed and latency (TTFT, streaming `tok/s`, end-to-end `tok/s`, and thinking vs visible response token splits), analyze context compaction (`CHECKPOINT`) behaviors, and manage context window limit binary configurations (128K, 256K, 320K, 384K).
+Unified toolset to audit Antigravity local session token consumption, calculate Google Gemini and Anthropic Claude model costs (via SQLite `gen_metadata` and `steps` ground-truth attribution), measure conversation output speed and latency (TTFT, streaming `tok/s`, end-to-end `tok/s`, and thinking vs visible response token splits), analyze context compaction (`CHECKPOINT`) behaviors, and manage context window limit binary configurations (`128K`, `256K`, `320K`, `384K`, `512K`, `768K`, `1M`).
 
 All execution logic is self-contained in Python standard-library scripts under `scripts/`.
 
@@ -17,8 +17,8 @@ All execution logic is self-contained in Python standard-library scripts under `
 | :--- | :--- | :--- |
 | **Daily & Weekly Reporter** | [`scripts/report_daily_tokens.py`](scripts/report_daily_tokens.py) | Automated daily token reporter (yesterday's metrics on weekdays/weekends, past 7 days on Mondays) with Gemini + Claude attribution, output speed/TTFT metrics, subagent hierarchy, and compaction audits. |
 | **Token & Cost Analyzer** | [`scripts/analyze_tokens.py`](scripts/analyze_tokens.py) | Scans all transcripts and SQLite databases to aggregate input, cache, thinking, and response tokens, output throughput (`tok/s`), TTFT latency, and Gemini + Claude API expenses across time intervals or by `--session`. |
-| **Compact Analyzer** | [`scripts/analyze_compact.py`](scripts/analyze_compact.py) | Computes empirical context compaction thresholds, interaction steps, and post-compact reduction percentages by model. |
-| **Token Limit Manager** | [`scripts/manage_token_limit.py`](scripts/manage_token_limit.py) | Inspects status and configures `language_server`'s context window limits (128K, 256K, 320K, 384K) across all models or by specific model (Flash/Argon). |
+| **Compact Analyzer** | [`scripts/analyze_compact.py`](scripts/analyze_compact.py) | Computes empirical context compaction thresholds, interaction steps, post-compact reduction percentages by model, or step-by-step trajectory via `--session`. |
+| **Token Limit Manager** | [`scripts/manage_token_limit.py`](scripts/manage_token_limit.py) | Inspects status and configures `language_server`'s context window limits (`128K`, `256K`, `320K`, `384K`, `512K`, `768K`, `1M`) across `.rdata` JSON slots and 5 x86_64 machine-code clamp/override points. |
 | **Pricing Core** | [`scripts/pricing.py`](scripts/pricing.py) | Houses official fallback Gemini & Claude rates, local cache (`gemini_pricing.json`), model enum/backend resolution, and online synchronization logic. |
 | **Transcript & Formatter** | [`scripts/transcript.py`](scripts/transcript.py), [`scripts/formatter.py`](scripts/formatter.py) | Single-pass streaming transcript/SQLite parser (extracting tokens, thinking/response splits, TTFT/streaming durations, and per-step models) and East Asian character-aware terminal table renderer. |
 
@@ -64,40 +64,50 @@ python3 scripts/analyze_tokens.py --period today --json
 Execute [`scripts/analyze_compact.py`](scripts/analyze_compact.py) to evaluate model truncation and context compaction dynamics:
 
 ```bash
-# Formatted terminal report
+# Formatted terminal report across all sessions
 python3 scripts/analyze_compact.py
+
+# Step-by-step context trajectory and CHECKPOINT audit for a specific session
+python3 scripts/analyze_compact.py --session <conversation-id>
 
 # Raw JSON data
 python3 scripts/analyze_compact.py --json
 ```
 
 **Key Metrics**:
-* **Context Window at Trigger**: `input_tokens + cache_read_tokens` at compaction moment (~108.8K for default 128K limit, ~217.6K under 256K patch).
+* **Context Window at Trigger**: `input_tokens + cache_read_tokens` at compaction moment (`CHECKPOINT` triggers immediately after crossing `100%` of `max_token_limit` for both `Gemini 3.8 Flash` and `Gemini 4 Argon`, e.g., `> 256,000` for `256K`, `> 512,000` for `512K`, and `> 840,000` for `1M (840K)`).
 * **Cumulative Flow**: Total accumulated token throughput between consecutive compaction events.
-* **Reduction Percentage**: Context size reduction achieved after compaction (typically 70% to 82%).
+* **Reduction Percentage**: Context size reduction achieved after compaction (typically 70% to 97%).
 
 ---
 
-### Workflow C: Manage Context Token Limits (128K / 256K / 320K / 384K / 512K)
+### Workflow C: Manage Context Token Limits (128K / 256K / 320K / 384K / 512K / 768K / 1M)
 
 Execute [`scripts/manage_token_limit.py`](scripts/manage_token_limit.py) to inspect and configure the language service binary:
 
 ```bash
-# 1. Check current token limits and model trigger watermarks
+# 1. Check current token limits, machine-code clamps, and Mendel override status
 python3 scripts/manage_token_limit.py --status
 
-# 2. Upgrade all models (Flash and Argon) to 256K, 320K, 384K, or 512K
+# 2. Upgrade all models (Flash and Argon) to 256K, 320K, 384K, 512K, 768K, or 1M
 python3 scripts/manage_token_limit.py --set 256k
-python3 scripts/manage_token_limit.py --set 384k
 python3 scripts/manage_token_limit.py --set 512k
+python3 scripts/manage_token_limit.py --set 768k
+python3 scripts/manage_token_limit.py --set 1m
 
-# 3. Target specific models independently (e.g. Flash 512K, Argon 384K)
+# 3. Target specific models independently (e.g. Flash 512K, Argon 1M)
 python3 scripts/manage_token_limit.py --set 512k --model flash
-python3 scripts/manage_token_limit.py --set 512k --model argon
+python3 scripts/manage_token_limit.py --set 1m --model argon
 
-# 4. Restore official defaults: Flash 128K (~108.8K trigger) & Argon 256K (~217.6K trigger)
+# 4. Restore official defaults: Flash 128K, Argon 256K, Clamp 256K, Cloud Mendel Active
 python3 scripts/manage_token_limit.py --restore
 ```
+
+**Binary Patch Architecture (x86_64)**:
+* **`.rdata` `snapshotmendelfp` 12-Byte JSON Slots**: Updates the 2 `FLASH_PREFIX` and 3 `ARGON_PREFIX` `max_token_limit` slots in-place without shifting binary offsets. For `--set 1m` (or `840k`), `max_token_limit` is set to `840000` (`840K`, matching Google's built-in `claude-1m_840k` profile) so it passes `ValidateCheckpointConfig` (`MaxTokenLimit <= MaxTokens - MaxOutputTokens`, i.e. `840,000 <= 1,000,000 - 65,536 = 934,464`) and reserves `160K` tokens for single-turn tool output growth and checkpoint summarization.
+* **Pattern 1 & 2 (`GetCheckpointConfigForModelInfo`)**: Raises the 3 hardcoded `uint32` fallback constants (`0x3e800 -> target`) and replaces `cmovb` (`0f 42 f2`) with `nop` (`90 90 90`) when `limit > 256K`.
+* **Pattern 3 (`(*overlayFeatureProvider).GetProto`)**: Patches `74 29 -> eb 29` so `CASCADE_USE_EXPERIMENT_CHECKPOINTER` Protobuf lookups always read from local `p.base` (`snapshotmendelfp`) instead of cloud `MendelStateCache`.
+* **Pattern 4 (`(*snapshotFallbackFactory).NewProvider`)**: Patches `74 57 -> 90 90` after `HasNoCCPAAccess()` so authenticated sessions always construct `overlayFeatureProvider(base=snapshotmendelfp, overlay=liveMendelStateCache)` rather than short-circuiting to pure cloud `*MendelAdapter`.
 
 > [!IMPORTANT]
 > Fully quit and restart the Antigravity application after applying modifications for new context limit configurations and compaction watermarks to take effect.

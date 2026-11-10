@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Antigravity Context Token Limit Manager CLI
-Configures max_token_limit thresholds (128K, 256K, 320K, 384K, 512K) for language_server.
+Configures max_token_limit thresholds (128K, 256K, 320K, 384K, 512K, 768K, 1M) for language_server.
 Supports updating all models simultaneously or targeting specific models (Flash, Argon).
 Cross-platform compatible: macOS (ARM64) and Windows (x86_64).
 Zero-dependency using Python standard library.
@@ -10,6 +10,7 @@ Zero-dependency using Python standard library.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import shutil
 import struct
@@ -19,16 +20,29 @@ import sys
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 
-# Model-specific exact strategy prefixes in language_server binary
-FLASH_PREFIX = rb'\"strategy\": \"CHECKPOINT_STRATEGY_SINGLE_PROMPT\",\n    \"max_token_limit\": \"'
-ARGON_PREFIX = rb'\"strategy\": \"CHECKPOINT_STRATEGY_SAME_MODEL\",\n    \"max_token_limit\": \"'
+# Model-specific exact strategy key prefixes in language_server binary (.rdata snapshotmendelfp JSON).
+# Anchored on '"CASCADE_USE_EXPERIMENT_CHECKPOINTER": "' so 'CASCADE_USE_EXPERIMENT_CHECKPOINTER/claude-1m_840k'
+# is never matched or overwritten.
+FLASH_PREFIX = rb'"CASCADE_USE_EXPERIMENT_CHECKPOINTER": "{\n    \"strategy\": \"CHECKPOINT_STRATEGY_SINGLE_PROMPT\",\n    \"max_token_limit\"'
+ARGON_PREFIX = rb'"CASCADE_USE_EXPERIMENT_CHECKPOINTER": "{\n    \"strategy\": \"CHECKPOINT_STRATEGY_SAME_MODEL\",\n    \"max_token_limit\"'
+SLOT_BYTE_LEN = 12
 
+# Note on 1M context window models ('1m' / '840k'):
+# ValidateCheckpointConfig (0x1827600) enforces:
+#   config.MaxTokenLimit <= plannerModel.MaxTokens - plannerModel.MaxOutputTokens
+# where MaxTokens is 1,000,000 (or 1,048,576) and MaxOutputTokens is 65,536 (or 128,000 -> max allowed 872,000 / 934,464).
+# Setting MaxTokenLimit to raw 1,000,000 fails ValidateCheckpointConfig and leaves zero room for single-turn tool growth
+# + checkpoint summary output. Following Google's built-in 'claude-1m_840k' profile, '1m' (and '840k') sets
+# max_token_limit to 840,000 (840K), leaving 160K tokens for MaxOutputTokens (65,536) and in-step tool output.
 SUPPORTED_LIMITS: dict[str, bytes] = {
     "128k": b"128000",
     "256k": b"256000",
     "320k": b"320000",
     "384k": b"384000",
     "512k": b"512000",
+    "768k": b"768000",
+    "840k": b"840000",
+    "1m": b"840000",
 }
 
 SUPPORTED_LIMITS_INT: dict[str, int] = {
@@ -37,14 +51,21 @@ SUPPORTED_LIMITS_INT: dict[str, int] = {
     "320k": 320000,
     "384k": 384000,
     "512k": 512000,
+    "768k": 768000,
+    "840k": 840000,
+    "1m": 840000,
 }
 
 TRIGGER_THRESHOLDS: dict[str, str] = {
-    "128k": "~108.8K tokens (~85% watermark)",
-    "256k": "~217.6K tokens (~85% watermark)",
-    "320k": "~272.0K tokens (~85% watermark)",
-    "384k": "~326.4K tokens (~85% watermark)",
-    "512k": "~435.2K tokens (~85% watermark)",
+    "128k": "128,000 tokens (100% max_token_limit)",
+    "256k": "256,000 tokens (100% max_token_limit)",
+    "320k": "320,000 tokens (100% max_token_limit)",
+    "384k": "384,000 tokens (100% max_token_limit)",
+    "512k": "512,000 tokens (100% max_token_limit)",
+    "768k": "768,000 tokens (100% max_token_limit)",
+    "840k": "840,000 tokens (1M-Window Safe Cap, 160K reserved)",
+    "1m": "840,000 tokens (1M-Window Safe Cap, 160K reserved)",
+    "1m (840k)": "840,000 tokens (1M-Window Safe Cap, 160K reserved)",
 }
 
 VALUE_TO_LABEL: dict[bytes, str] = {
@@ -53,6 +74,8 @@ VALUE_TO_LABEL: dict[bytes, str] = {
     b"320000": "320K",
     b"384000": "384K",
     b"512000": "512K",
+    b"768000": "768K",
+    b"840000": "1M (840K)",
 }
 
 INT_TO_LABEL: dict[int, str] = {
@@ -61,6 +84,8 @@ INT_TO_LABEL: dict[int, str] = {
     320000: "320K",
     384000: "384K",
     512000: "512K",
+    768000: "768K",
+    840000: "1M (840K)",
 }
 
 # ---------------------------------------------------------------------------
@@ -78,6 +103,20 @@ X86_CLAMP_P1_SUFFIX = X86_CLAMP_P1_SUFFIX_CMOVB
 # cmp dword ptr [rdx+0x14], 0; jg +7; mov dword ptr [rax+0x0c], <LIMIT>; xor ebx, ebx; xor ecx, ecx
 X86_CLAMP_P2_PREFIX = b"\x83\x7a\x14\x00\x7f\x07\xc7\x40\x0c"
 X86_CLAMP_P2_SUFFIX = b"\x31\xdb\x31\xc9"
+
+# Pattern 3: Cloud MendelStateCache GetProto override in (*overlayFeatureProvider).GetProto
+# test bl, bl; je +0x29 (74 29 -> eb 29); mov rdx, [rsp+0x38]; mov r8, [rdx+0x10]; mov rax, [rdx+0x18]; mov rdx, [r8+0x38]
+X86_OVERLAY_P3_PREFIX = b"\x84\xdb"
+X86_OVERLAY_P3_JE = b"\x74\x29"
+X86_OVERLAY_P3_JMP = b"\xeb\x29"
+X86_OVERLAY_P3_SUFFIX = b"\x48\x8b\x54\x24\x38\x4c\x8b\x42\x10\x48\x8b\x42\x18\x49\x8b\x50\x38"
+
+# Pattern 4: (*snapshotFallbackFactory).NewProvider HasNoCCPAAccess check bypass
+# mov rdx, [rax+0x28]; mov rax, [rdx]; call rax; test al, al; je +0x57 (74 57 -> 90 90); mov rdx, [rsp+0x40]; mov rsi, [rdx+0x10]
+X86_FALLBACK_P4_PREFIX = b"\x48\x8b\x50\x28\x48\x8b\x02\xff\xd0\x84\xc0"
+X86_FALLBACK_P4_JE = b"\x74\x57"
+X86_FALLBACK_P4_NOP = b"\x90\x90"
+X86_FALLBACK_P4_SUFFIX = b"\x48\x8b\x54\x24\x40\x48\x8b\x72\x10"
 
 
 def get_default_paths() -> tuple[str, str]:
@@ -134,8 +173,28 @@ def verify_codesign(file_path: str) -> tuple[bool, str]:
         return False, f"Verification error: {e}"
 
 
+def _extract_slot_digits(slot: bytes) -> bytes | None:
+    """Extract 6-digit or 7-digit ASCII token limit from a 12-byte JSON slot."""
+    if len(slot) != SLOT_BYTE_LEN:
+        return None
+    if slot.startswith(rb': \"') and slot.endswith(rb'\"'):
+        return slot[4:10]
+    if slot.startswith(rb':\"') and slot.endswith(rb'\"'):
+        return slot[3:10]
+    return None
+
+
+def _encode_slot_digits(val_bytes: bytes) -> bytes:
+    """Encode 6-digit or 7-digit ASCII token limit into an exact 12-byte JSON slot."""
+    if len(val_bytes) == 6:
+        return rb': \"' + val_bytes + rb'\"'
+    if len(val_bytes) == 7:
+        return rb':\"' + val_bytes + rb'\"'
+    raise ValueError(f"Unsupported token limit byte length: {len(val_bytes)}")
+
+
 def inspect_model_values(data: bytes, prefix: bytes) -> tuple[str, int]:
-    """Inspect current 6-byte token limit value and occurrence count for a given prefix."""
+    """Inspect current 12-byte token limit slot and occurrence count for a given prefix."""
     pos = 0
     values: set[bytes] = set()
     count = 0
@@ -144,14 +203,14 @@ def inspect_model_values(data: bytes, prefix: bytes) -> tuple[str, int]:
         if idx == -1:
             break
         val_start = idx + len(prefix)
-        val = data[val_start : val_start + 6]
-        # Preserve claude-1m_840k so it does not skew Argon metrics
-        if val == b"840000":
-            pos = val_start + 6
+        slot = data[val_start : val_start + SLOT_BYTE_LEN]
+        val = _extract_slot_digits(slot)
+        if val is None:
+            pos = val_start + SLOT_BYTE_LEN
             continue
         values.add(val)
         count += 1
-        pos = val_start + 6
+        pos = val_start + SLOT_BYTE_LEN
 
     if not values:
         return "Not found", 0
@@ -162,23 +221,24 @@ def inspect_model_values(data: bytes, prefix: bytes) -> tuple[str, int]:
 
 
 def replace_model_limit(data: bytes, prefix: bytes, new_val: bytes) -> tuple[bytes, int]:
-    """Replace 6-byte token limit following the exact model prefix in-place."""
+    """Replace 12-byte token limit slot following the exact model prefix in-place."""
     pos = 0
     count = 0
     out = bytearray(data)
+    new_slot = _encode_slot_digits(new_val)
     while True:
         idx = out.find(prefix, pos)
         if idx == -1:
             break
         val_start = idx + len(prefix)
-        val = bytes(out[val_start : val_start + 6])
-        # Preserve claude-1m_840k without downgrading
-        if val == b"840000":
-            pos = val_start + 6
+        slot = bytes(out[val_start : val_start + SLOT_BYTE_LEN])
+        val = _extract_slot_digits(slot)
+        if val is None:
+            pos = val_start + SLOT_BYTE_LEN
             continue
-        out[val_start : val_start + 6] = new_val
+        out[val_start : val_start + SLOT_BYTE_LEN] = new_slot
         count += 1
-        pos = val_start + 6
+        pos = val_start + SLOT_BYTE_LEN
     return bytes(out), count
 
 
@@ -231,10 +291,35 @@ def inspect_binary_clamp(data: bytes) -> tuple[str, list[int], str, bool]:
     return "Not found", [], "unknown", False
 
 
-def replace_binary_clamp(data: bytes, limit_key: str) -> tuple[bytes, int, str]:
+def inspect_mendel_overlay(data: bytes) -> tuple[bool, bool]:
+    """
+    Inspect (*overlayFeatureProvider).GetProto and (*snapshotFallbackFactory).NewProvider
+    cloud MendelStateCache override status.
+    Returns: (pattern_found, is_bypassed)
+    """
+    pat3_je = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JE + X86_OVERLAY_P3_SUFFIX
+    pat3_jmp = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JMP + X86_OVERLAY_P3_SUFFIX
+    pat4_je = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_JE + X86_FALLBACK_P4_SUFFIX
+    pat4_nop = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_NOP + X86_FALLBACK_P4_SUFFIX
+
+    p3_bypassed = data.find(pat3_jmp) != -1
+    p3_found = p3_bypassed or (data.find(pat3_je) != -1)
+    p4_bypassed = data.find(pat4_nop) != -1
+    p4_found = p4_bypassed or (data.find(pat4_je) != -1)
+
+    if p3_found and p4_found:
+        return True, (p3_bypassed and p4_bypassed)
+    if p3_found:
+        return True, p3_bypassed
+    return False, False
+
+
+def replace_binary_clamp(data: bytes, limit_key: str, restore_overlay: bool = False) -> tuple[bytes, int, str]:
     """
     Patch hardcoded binary clamp thresholds in machine code to match desired limit.
-    Bypasses cmovb down-clamping for limits > 256K to ensure full context utilization.
+    Bypasses cmovb down-clamping for limits > 256K and bypasses cloud Mendel GetProto
+    and snapshotFallbackFactory HasNoCCPAAccess checks so local snapshotmendelfp JSON
+    limits take effect at runtime.
     Returns: (modified_bytes, replaced_count, architecture_name)
     """
     target_int = SUPPORTED_LIMITS_INT.get(limit_key.lower())
@@ -272,12 +357,48 @@ def replace_binary_clamp(data: bytes, limit_key: str) -> tuple[bytes, int, str]:
             out[v3_start:v3_end] = target_bytes
             count += 1
 
+    # 3. Patch x86_64 Pattern 3: (*overlayFeatureProvider).GetProto cloud Mendel override
+    pat_je = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JE + X86_OVERLAY_P3_SUFFIX
+    pat_jmp = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JMP + X86_OVERLAY_P3_SUFFIX
+    idx3 = out.find(pat_je)
+    if idx3 == -1:
+        idx3 = out.find(pat_jmp)
+    if idx3 != -1:
+        br_start = idx3 + len(X86_OVERLAY_P3_PREFIX)
+        br_end = br_start + 2
+        out[br_start:br_end] = X86_OVERLAY_P3_JE if restore_overlay else X86_OVERLAY_P3_JMP
+        count += 1
+
+    # 4. Patch x86_64 Pattern 4: (*snapshotFallbackFactory).NewProvider HasNoCCPAAccess check
+    pat4_je = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_JE + X86_FALLBACK_P4_SUFFIX
+    pat4_nop = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_NOP + X86_FALLBACK_P4_SUFFIX
+    idx4 = out.find(pat4_je)
+    if idx4 == -1:
+        idx4 = out.find(pat4_nop)
+    if idx4 != -1:
+        br4_start = idx4 + len(X86_FALLBACK_P4_PREFIX)
+        br4_end = br4_start + 2
+        out[br4_start:br4_end] = X86_FALLBACK_P4_JE if restore_overlay else X86_FALLBACK_P4_NOP
+        count += 1
+
     arch = "x86_64" if count > 0 else "unknown"
     return bytes(out), count, arch
 
 
+def _cleanup_stale_old_binaries(target_path: str) -> None:
+    """Remove unlocked stale language_server.exe.old* files left from previous online atomic updates."""
+    if not IS_WINDOWS:
+        return
+    for old_file in glob.glob(f"{target_path}.old*"):
+        try:
+            os.remove(old_file)
+        except Exception:
+            pass
+
+
 def check_status(target_path: str, backup_path: str) -> bool:
     """Inspect and report current token limit configuration, model thresholds, clamp status, and signature status."""
+    _cleanup_stale_old_binaries(target_path)
     if not os.path.exists(target_path):
         print(f"Error: Target file not found: {target_path}")
         return False
@@ -288,6 +409,7 @@ def check_status(target_path: str, backup_path: str) -> bool:
     flash_val, flash_count = inspect_model_values(data, FLASH_PREFIX)
     argon_val, argon_count = inspect_model_values(data, ARGON_PREFIX)
     clamp_status, clamp_vals, clamp_arch, is_unclamped = inspect_binary_clamp(data)
+    overlay_found, overlay_bypassed = inspect_mendel_overlay(data)
 
     line_sep = "=" * 60
     print(line_sep)
@@ -307,18 +429,24 @@ def check_status(target_path: str, backup_path: str) -> bool:
     print(f"  - Gemini Flash: {flash_val} ({flash_count} markers) -> trigger: {flash_trig}")
     print(f"  - Gemini Argon: {argon_val} ({argon_count} markers) -> trigger: {argon_trig}")
 
+    elevated_labels = ("320K", "384K", "512K", "768K", "840K", "1M", "1M (840K)")
     print(f"\nBinary Clamp Status (Machine Code):")
     if clamp_arch == "x86_64":
-        if clamp_status.upper() in ("384K", "512K"):
+        if clamp_status.upper() in elevated_labels:
             unclamp_tag = " [Hard Floor & Ceiling Locked: cmovb clamp bypassed]" if is_unclamped else ""
             print(f"  - x86_64 Clamp: {clamp_status} ({len(clamp_vals)} locations patched){unclamp_tag} -> Hard ceiling raised successfully")
         elif clamp_status.upper() == "256K":
-            if flash_val.upper() in ("384K", "512K") or argon_val.upper() in ("384K", "512K"):
+            if flash_val.upper() in elevated_labels or argon_val.upper() in elevated_labels:
                 print(f"  - x86_64 Clamp: 256K [WARNING: Hard ceiling clamp active at 256K; will truncate models configured for >256K!]")
             else:
                 print(f"  - x86_64 Clamp: 256K (Official default baseline)")
         else:
             print(f"  - x86_64 Clamp: {clamp_status} (Values: {clamp_vals})")
+        if overlay_found:
+            if overlay_bypassed:
+                print("  - Cloud Mendel Override: Bypassed (eb 29 + 90 90 -> Local snapshotmendelfp config authoritative)")
+            else:
+                print("  - Cloud Mendel Override: Active (74 29 / 74 57) [WARNING: Cloud MendelStateCache will override local JSON limits to 256K!]")
     else:
         print(f"  - Status: {clamp_status}")
 
@@ -341,13 +469,14 @@ def set_token_limit(
     model: str = "all",
 ) -> None:
     """
-    Set max_token_limit to 128k, 256k, 320k, 384k, or 512k.
+    Set max_token_limit to 128k, 256k, 320k, 384k, 512k, 768k, 840k, or 1m (maps to 840K safe ceiling).
     Can update all models simultaneously or target 'flash' or 'argon' specifically.
     Automatically synchronizes machine-code clamp limits to prevent truncation.
     """
+    _cleanup_stale_old_binaries(target_path)
     limit_key = limit.lower()
     if limit_key not in SUPPORTED_LIMITS:
-        print(f"Error: Unsupported limit '{limit}'. Choose from: 128k, 256k, 320k, 384k, 512k.")
+        print(f"Error: Unsupported limit '{limit}'. Choose from: 128k, 256k, 320k, 384k, 512k, 768k, 840k, 1m.")
         sys.exit(1)
 
     model_target = model.lower()
@@ -370,51 +499,31 @@ def set_token_limit(
         data = fp.read()
 
     new_val_bytes = SUPPORTED_LIMITS[limit_key]
+    display_lbl = VALUE_TO_LABEL.get(new_val_bytes, limit_key.upper())
     updated_data = data
     summary_messages: list[str] = []
 
     # Apply to Flash
     if model_target in ("all", "flash"):
         updated_data, c_flash = replace_model_limit(updated_data, FLASH_PREFIX, new_val_bytes)
-        summary_messages.append(f"Gemini Flash: updated {c_flash} JSON markers to {limit_key.upper()} ({TRIGGER_THRESHOLDS[limit_key]})")
+        summary_messages.append(f"Gemini Flash: updated {c_flash} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})")
 
     # Apply to Argon
     if model_target in ("all", "argon"):
         updated_data, c_argon = replace_model_limit(updated_data, ARGON_PREFIX, new_val_bytes)
-        summary_messages.append(f"Gemini Argon: updated {c_argon} JSON markers to {limit_key.upper()} ({TRIGGER_THRESHOLDS[limit_key]})")
+        summary_messages.append(f"Gemini Argon: updated {c_argon} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})")
 
     # Apply Machine-Code Clamp Patch
     updated_data, c_clamp, c_arch = replace_binary_clamp(updated_data, limit_key)
     if c_clamp > 0:
-        summary_messages.append(f"Binary Clamp ({c_arch}): patched {c_clamp} machine-code clamp locations to {limit_key.upper()}")
+        summary_messages.append(f"Binary Clamp ({c_arch}): patched {c_clamp} machine-code clamp locations to {display_lbl}")
 
     if len(updated_data) != len(data):
         print("Error: Modified binary size mismatch. Aborting for safety!")
         sys.exit(1)
 
     # 3. Write modified binary
-    try:
-        with open(target_path, "wb") as fp:
-            fp.write(updated_data)
-    except PermissionError as e:
-        if IS_WINDOWS:
-            old_path = target_path + ".old"
-            if os.path.exists(old_path):
-                try:
-                    os.remove(old_path)
-                except Exception:
-                    pass
-            try:
-                os.rename(target_path, old_path)
-                with open(target_path, "wb") as fp:
-                    fp.write(updated_data)
-                print("Notice: Binary was updated via atomic rename because language_server is running.")
-            except Exception as rename_err:
-                print(f"Error: Failed to write to target file ({e}) and atomic rename fallback also failed ({rename_err}).")
-                sys.exit(1)
-        else:
-            print(f"Error: Failed to write to target file ({e}). Please ensure the file is not locked and has write permissions.")
-            sys.exit(1)
+    _atomic_write_binary(target_path, updated_data)
 
     # 4. Re-sign binary on macOS
     if IS_MACOS:
@@ -435,8 +544,38 @@ def set_token_limit(
     print("Please fully quit and restart the Antigravity application for changes to take effect.")
 
 
+def _atomic_write_binary(target_path: str, data: bytes) -> None:
+    """Write binary data to target_path, falling back to atomic rename on Windows if locked."""
+    try:
+        with open(target_path, "wb") as fp:
+            fp.write(data)
+    except PermissionError as e:
+        if IS_WINDOWS:
+            for suffix in ["", ".1", ".2", ".3", ".4"]:
+                cand = f"{target_path}.old{suffix}"
+                if os.path.exists(cand):
+                    try:
+                        os.remove(cand)
+                    except Exception:
+                        continue
+                try:
+                    os.rename(target_path, cand)
+                    with open(target_path, "wb") as fp:
+                        fp.write(data)
+                    print("Notice: Binary was updated via atomic rename because language_server is running.")
+                    return
+                except Exception:
+                    continue
+            print(f"Error: Failed to write to target file ({e}) and atomic rename fallback also failed.")
+            sys.exit(1)
+        else:
+            print(f"Error: Failed to write to target file ({e}). Please ensure the file is not locked and has write permissions.")
+            sys.exit(1)
+
+
 def restore_official_defaults(target_path: str, backup_path: str) -> None:
     """Restore official default baseline (Flash 128K, Argon 256K, Clamp 256K) from backup or in-place."""
+    _cleanup_stale_old_binaries(target_path)
     if os.path.exists(backup_path):
         with open(backup_path, "rb") as fp:
             bdata = fp.read()
@@ -445,20 +584,7 @@ def restore_official_defaults(target_path: str, backup_path: str) -> None:
         c_status, _, _, _ = inspect_binary_clamp(bdata)
         if f_val == "128K" and a_val == "256K" and c_status == "256K":
             print(f"Restoring clean binary from official backup: {backup_path} -> {target_path} ...")
-            try:
-                shutil.copy2(backup_path, target_path)
-            except PermissionError:
-                if IS_WINDOWS:
-                    old_path = target_path + ".old"
-                    if os.path.exists(old_path):
-                        try:
-                            os.remove(old_path)
-                        except Exception:
-                            pass
-                    os.rename(target_path, old_path)
-                    shutil.copy2(backup_path, target_path)
-                else:
-                    raise
+            _atomic_write_binary(target_path, bdata)
             if IS_MACOS:
                 print("Verifying official signature ...")
                 try:
@@ -467,45 +593,32 @@ def restore_official_defaults(target_path: str, backup_path: str) -> None:
                 except Exception:
                     print("Re-applying ad-hoc signature ...")
                     subprocess.call(["codesign", "-f", "-s", "-", target_path])
-            print("Successfully restored official baseline: Flash 128K (~108.8K trigger), Argon 256K (~217.6K trigger), Clamp 256K.")
+            print("Successfully restored official baseline: Flash 128K (~108.8K trigger), Argon 256K (256K trigger), Clamp 256K.")
             print("Please restart the Antigravity application.")
             return
 
     # Fallback to in-place replacement
     set_token_limit(target_path, backup_path, limit="128k", model="flash")
     set_token_limit(target_path, backup_path, limit="256k", model="argon")
-    # Clamp restore to 256k
+    # Clamp and Mendel overlay restore to official baseline
     with open(target_path, "rb") as fp:
         cur_d = fp.read()
-    cur_d, _, _ = replace_binary_clamp(cur_d, "256k")
-    try:
-        with open(target_path, "wb") as fp:
-            fp.write(cur_d)
-    except PermissionError:
-        if IS_WINDOWS:
-            old_path = target_path + ".old"
-            if os.path.exists(old_path):
-                try:
-                    os.remove(old_path)
-                except Exception:
-                    pass
-            os.rename(target_path, old_path)
-            with open(target_path, "wb") as fp:
-                fp.write(cur_d)
+    cur_d, _, _ = replace_binary_clamp(cur_d, "256k", restore_overlay=True)
+    _atomic_write_binary(target_path, cur_d)
 
 
 def main() -> None:
     """CLI entry point for context token limit manager."""
     default_target, default_backup = get_default_paths()
     parser = argparse.ArgumentParser(
-        description="Antigravity Context Token Limit Manager CLI (Switch between 128K, 256K, 320K, 384K, and 512K)"
+        description="Antigravity Context Token Limit Manager CLI (Switch between 128K, 256K, 320K, 384K, 512K, 768K, and 1M/840K)"
     )
     parser.add_argument(
         "--set",
         "--limit",
         dest="limit",
-        choices=["128k", "256k", "320k", "384k", "512k"],
-        help="Target context window limit to configure: 128k, 256k, 320k, 384k, or 512k",
+        choices=["128k", "256k", "320k", "384k", "512k", "768k", "840k", "1m"],
+        help="Target context window limit to configure: 128k, 256k, 320k, 384k, 512k, 768k, 840k, or 1m (sets 840K safe ceiling for 1M models)",
     )
     parser.add_argument(
         "--model",
