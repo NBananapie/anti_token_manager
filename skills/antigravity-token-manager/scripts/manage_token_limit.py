@@ -2,7 +2,7 @@
 """
 Antigravity Context Token Limit Manager CLI
 Configures max_token_limit thresholds (128K, 256K, 320K, 384K, 512K, 768K, 1M) for language_server.
-Supports updating all models simultaneously or targeting specific models (Flash, Argon).
+Supports updating all models simultaneously or targeting specific models (Flash, Argon, Carbon).
 Cross-platform compatible: macOS (ARM64) and Windows (x86_64).
 Zero-dependency using Python standard library.
 """
@@ -426,8 +426,8 @@ def check_status(target_path: str, backup_path: str) -> bool:
     argon_trig = TRIGGER_THRESHOLDS.get(argon_key, "custom threshold")
 
     print(f"\nModel Token Limits (JSON Config):")
-    print(f"  - Gemini Flash: {flash_val} ({flash_count} markers) -> trigger: {flash_trig}")
-    print(f"  - Gemini Argon: {argon_val} ({argon_count} markers) -> trigger: {argon_trig}")
+    print(f"  - Gemini 3.8 Flash:        {flash_val} ({flash_count} markers) -> trigger: {flash_trig}")
+    print(f"  - Gemini 4 Argon / Carbon: {argon_val} ({argon_count} markers) -> trigger: {argon_trig}")
 
     elevated_labels = ("320K", "384K", "512K", "768K", "840K", "1M", "1M (840K)")
     print(f"\nBinary Clamp Status (Machine Code):")
@@ -470,7 +470,7 @@ def set_token_limit(
 ) -> None:
     """
     Set max_token_limit to 128k, 256k, 320k, 384k, 512k, 768k, 840k, or 1m (maps to 840K safe ceiling).
-    Can update all models simultaneously or target 'flash' or 'argon' specifically.
+    Can update all models simultaneously or target 'flash', 'argon', or 'carbon' specifically.
     Automatically synchronizes machine-code clamp limits to prevent truncation.
     """
     _cleanup_stale_old_binaries(target_path)
@@ -480,8 +480,8 @@ def set_token_limit(
         sys.exit(1)
 
     model_target = model.lower()
-    if model_target not in ("all", "flash", "argon"):
-        print(f"Error: Unsupported model scope '{model}'. Choose from: 'all', 'flash', 'argon'.")
+    if model_target not in ("all", "flash", "argon", "carbon"):
+        print(f"Error: Unsupported model scope '{model}'. Choose from: 'all', 'flash', 'argon', 'carbon'.")
         sys.exit(1)
 
     if not os.path.exists(target_path):
@@ -506,12 +506,14 @@ def set_token_limit(
     # Apply to Flash
     if model_target in ("all", "flash"):
         updated_data, c_flash = replace_model_limit(updated_data, FLASH_PREFIX, new_val_bytes)
-        summary_messages.append(f"Gemini Flash: updated {c_flash} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})")
+        summary_messages.append(f"Gemini 3.8 Flash: updated {c_flash} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})")
 
-    # Apply to Argon
-    if model_target in ("all", "argon"):
+    # Apply to Argon / Carbon (shared Gemini 4 CHECKPOINT_STRATEGY_SAME_MODEL slots in snapshotmendelfp)
+    if model_target in ("all", "argon", "carbon"):
         updated_data, c_argon = replace_model_limit(updated_data, ARGON_PREFIX, new_val_bytes)
-        summary_messages.append(f"Gemini Argon: updated {c_argon} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})")
+        summary_messages.append(
+            f"Gemini 4 Argon / Carbon: updated {c_argon} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})"
+        )
 
     # Apply Machine-Code Clamp Patch
     updated_data, c_clamp, c_arch = replace_binary_clamp(updated_data, limit_key)
@@ -622,9 +624,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        choices=["all", "flash", "argon"],
+        choices=["all", "flash", "argon", "carbon"],
         default="all",
-        help="Model scope to apply the limit: 'all' (default, updates all models), 'flash' (Flash only), or 'argon' (Argon only)",
+        help="Model scope to apply the limit: 'all' (default, updates all models), 'flash' (Flash only), or 'argon'/'carbon' (Gemini 4 Argon & Carbon)",
     )
     parser.add_argument(
         "--patch",

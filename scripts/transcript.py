@@ -328,10 +328,10 @@ def load_conversation_db_step_details(
                 g = bot_to_gen.get(bot_id) if bot_id else None
                 backend_m = g["backend_model"] if g else None
                 gen_enum = g["model_enum"] if g else None
-                resolved_model = (
-                    resolve_db_model_name(backend_m, step_enum if step_enum is not None else gen_enum)
-                    or fallback_gen_model
-                )
+                eff_enum = step_enum if step_enum is not None else gen_enum
+                resolved_model = resolve_db_model_name(backend_m, eff_enum)
+                if resolved_model is None and backend_m is None and eff_enum is None:
+                    resolved_model = fallback_gen_model
 
                 if thinking == 0 and response == 0 and g:
                     thinking = g["thinking_tokens"]

@@ -11,6 +11,12 @@
     "cache_read": 0.15,
     "output": 7.5
   },
+  "gemini-4-carbon": {
+    "name": "Gemini 4 Carbon (High)",
+    "input": 2.0,
+    "cache_read": 0.1,
+    "output": 10.0
+  },
   "gemini-4-argon": {
     "name": "Gemini 4 Argon (High)",
     "input": 2.0,

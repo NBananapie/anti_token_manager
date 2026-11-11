@@ -11,7 +11,7 @@ Logic:
   - Explicitly audits:
     1. Overall token usage, cache hit rate, and API costs across all models
     2. Provider breakdown (Google Gemini vs Anthropic Claude — always shown explicitly)
-    3. Granular model breakdown (Gemini 4 Argon, Gemini 3.8 Flash, Claude Opus/Sonnet/Haiku, etc.)
+    3. Granular model breakdown (Gemini 4 Carbon, Gemini 4 Argon, Gemini 3.8 Flash, Claude Opus/Sonnet/Haiku, etc.)
     4. Parent main agents vs derived subagents consumption breakdown
     5. Context compaction (checkpoint) event counts and metrics
     6. Daily trend and Top sessions (with per-session models)

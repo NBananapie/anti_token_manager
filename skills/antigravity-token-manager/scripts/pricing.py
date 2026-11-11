@@ -30,6 +30,12 @@ FALLBACK_GEMINI_PRICING: dict[str, dict[str, Any]] = {
         "cache_read": 0.15,
         "output": 7.50,
     },
+    "gemini-4-carbon": {
+        "name": "Gemini 4 Carbon (High)",
+        "input": 2.00,
+        "cache_read": 0.10,
+        "output": 10.00,
+    },
     "gemini-4-argon": {
         "name": "Gemini 4 Argon (High)",
         "input": 2.00,
@@ -147,6 +153,11 @@ MODEL_ENUM_DISPLAY_MAP: dict[int, str] = {
     1415: "Gemini 4 Argon (Low)",
     1416: "Gemini 4 Argon (Medium)",
     1417: "Gemini 4 Argon (High)",
+    1418: "Gemini 4 Argon (Medium)",
+    1419: "Gemini 4 Argon (Low)",
+    1429: "Gemini 4 Carbon (High)",
+    1430: "Gemini 4 Carbon (Medium)",
+    1431: "Gemini 4 Carbon (Low)",
 }
 
 # Backend gen_metadata raw model identifier -> standard display name
@@ -179,11 +190,21 @@ BACKEND_MODEL_DISPLAY_MAP: dict[str, str] = {
     "claude-sonnet-4": "Claude Sonnet 4",
     "claude-haiku-4-5@20251001": "Claude Haiku 4.5",
     "claude-haiku-4-5": "Claude Haiku 4.5",
+    "gemini-4-carbon-high": "Gemini 4 Carbon (High)",
+    "gemini-4-carbon-medium": "Gemini 4 Carbon (Medium)",
+    "gemini-4-carbon-low": "Gemini 4 Carbon (Low)",
+    "gemini-4-carbon-trial": "Gemini 4 Carbon (High)",
+    "gemini-4-carbon-w": "Gemini 4 Carbon (High)",
+    "gemini-4-carbon-b": "Gemini 4 Carbon (High)",
+    "gemini-4-carbon-e": "Gemini 4 Carbon (High)",
+    "gemini-4-carbon": "Gemini 4 Carbon (High)",
     "gemini-4-argon-high": "Gemini 4 Argon (High)",
     "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
     "gemini-4-argon-low": "Gemini 4 Argon (Low)",
     "gemini-4-argon-trial": "Gemini 4 Argon (High)",
     "gemini-4-argon-w": "Gemini 4 Argon (High)",
+    "gemini-4-argon-b": "Gemini 4 Argon (High)",
+    "gemini-4-argon-e": "Gemini 4 Argon (High)",
     "gemini-4-argon": "Gemini 4 Argon (High)",
     "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
     "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
@@ -258,26 +279,25 @@ def is_claude_model(model_name: str | None) -> bool:
 def resolve_db_model_name(backend_model: str | None, model_enum: int | None) -> str | None:
     """
     Resolve authoritative model display name from SQLite gen_metadata string and/or steps enum ID.
-    Prioritizes exact backend model string, then enum lookup table.
+    Prioritizes exact backend model string, refined by enum thinking tier when same model family.
     """
+    enum_disp = MODEL_ENUM_DISPLAY_MAP.get(model_enum) if model_enum is not None else None
     if backend_model:
         bm = backend_model.strip()
         bm_low = bm.lower()
         if bm_low in BACKEND_MODEL_DISPLAY_MAP:
-            # If enum provides a more specific thinking tier for generic @default backend IDs, prefer enum label
-            if "@default" in bm_low and model_enum in MODEL_ENUM_DISPLAY_MAP:
-                return MODEL_ENUM_DISPLAY_MAP[model_enum]
-            return BACKEND_MODEL_DISPLAY_MAP[bm_low]
+            bm_disp = BACKEND_MODEL_DISPLAY_MAP[bm_low]
+            # If enum provides a specific thinking tier within the same model family, prefer enum label
+            if enum_disp and bm_disp.split(" (")[0] == enum_disp.split(" (")[0]:
+                return enum_disp
+            return bm_disp
         # Dynamic / future Claude or Gemini model IDs in gen_metadata
-        if is_claude_model(bm_low) or "gemini" in bm_low or "argon" in bm_low:
-            if model_enum in MODEL_ENUM_DISPLAY_MAP:
-                return MODEL_ENUM_DISPLAY_MAP[model_enum]
+        if is_claude_model(bm_low) or any(k in bm_low for k in ("gemini", "argon", "carbon")):
+            if enum_disp and ("carbon" not in bm_low or "Carbon" in enum_disp):
+                return enum_disp
             return get_model_display_name(bm)
 
-    if model_enum is not None and model_enum in MODEL_ENUM_DISPLAY_MAP:
-        return MODEL_ENUM_DISPLAY_MAP[model_enum]
-
-    return None
+    return enum_disp
 
 
 def map_model_name_to_key(model_name: str | None) -> str:
@@ -303,6 +323,8 @@ def map_model_name_to_key(model_name: str | None) -> str:
         return "claude-sonnet-5-5"
 
     # Google Gemini family
+    if "carbon" in mn:
+        return "gemini-4-carbon"
     if "argon" in mn or "gemini-4" in mn or "gemini 4" in mn:
         return "gemini-4-argon"
     if "lite" in mn:
@@ -325,6 +347,12 @@ def get_model_display_name(model_name: str | None) -> str:
     # Preserve human-readable model titles from session settings or enum resolution
     if any(clean.startswith(prefix) for prefix in ("Gemini ", "Claude ", "GPT-")):
         return clean
+    if "carbon" in low:
+        if "medium" in low:
+            return "Gemini 4 Carbon (Medium)"
+        if "low" in low:
+            return "Gemini 4 Carbon (Low)"
+        return "Gemini 4 Carbon (High)"
     key = map_model_name_to_key(clean)
     pricing = load_pricing()
     return pricing.get(key, FALLBACK_GEMINI_PRICING[DEFAULT_MODEL_KEY])["name"]

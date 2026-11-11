@@ -61,6 +61,11 @@ html, body, #root {
   color: #4338ca;
   border: 1px solid #c7d2fe;
 }
+.badge-carbon {
+  background: #f0fdfa;
+  color: #0f766e;
+  border: 1px solid #99f6e4;
+}
 .badge-unknown {
   background: #f1f5f9;
   color: #475569;

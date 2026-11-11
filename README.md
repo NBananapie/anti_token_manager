@@ -21,7 +21,7 @@ flowchart TD
         P_AUDIT["analyze_tokens.py<br/>(周期统计 / 计费核算 / 速率分析)"]
         P_DAILY["report_daily_tokens.py<br/>(昨日/周报定时报告生成器)"]
         P_COMPACT["analyze_compact.py<br/>(上下文压缩阈值与缩减分析)"]
-        P_LIMIT["manage_token_limit.py<br/>(128K~512K 窗口二进制配置)"]
+        P_LIMIT["manage_token_limit.py<br/>(128K~1M/840K 窗口二进制配置)"]
         P_TRANS["transcript.py & pricing.py<br/>(单遍流式解析器 / Gemini & Claude 价格引擎)"]
     end
 
@@ -50,7 +50,7 @@ flowchart TD
 
 ### 2.1 零侵入底层端点探测
 - 采用 Node.js 原生 `node:sqlite` 并发只读模式读取本地数据库，完全兼容 WAL 机制，不产生文件锁，不干扰 Antigravity 正常对话执行。
-- 逐轮流式解码 `gen_metadata` 中的 Protobuf 原始二进制负载，提取字段 19 携带的真实物理模型端点标识（例如 `gemini-3.8-flash`、`gemini-3.8-flash-n`、`gemini-4-argon-trial`、`claude-opus-5-5-high` 等）。
+- 逐轮流式解码 `gen_metadata` 中的 Protobuf 原始二进制负载，提取字段 19 携带的真实物理模型端点标识（例如 `gemini-3.8-flash`、`gemini-3.8-flash-n`、`gemini-4-carbon`、`gemini-4-argon-trial`、`claude-opus-5-5-high` 等）。
 
 ### 2.2 速率与性能多维指标审计
 - **流式输出速率 (Stream TPS)**：统计首字到达至输出完成期间的吐字速率（`responseTokens / streamSec`），排除网络预填充与思考推理耗时。
@@ -59,7 +59,7 @@ flowchart TD
 - **思维链分离核算**：清晰分离思考推理 Token（`thinkingTokens`）与正文可见 Token（`responseTokens`），展示模型推理占比。
 
 ### 2.3 双厂商全模型计费核算
-- 内置 Google Gemini（Flash / Argon / Pro / Lite 系列）与 Anthropic Claude（Opus / Sonnet / Haiku 系列）官方价格模型与阶梯计费逻辑。
+- 内置 Google Gemini（Flash / Carbon / Argon / Pro / Lite 系列）与 Anthropic Claude（Opus / Sonnet / Haiku 系列）官方价格模型与阶梯计费逻辑。
 - 支持基于本地价格缓存文件 `gemini_pricing.json` 与在线实时同步，核算输入 Token、缓存命中 Token 与输出 Token 支出明细。
 
 ### 2.4 主子会话递归穿透归集
@@ -203,10 +203,11 @@ python scripts/manage_token_limit.py --set 512k
 python scripts/manage_token_limit.py --set 768k
 python scripts/manage_token_limit.py --set 1m
 
-# 3. 针对指定模型独立配置（例如仅将 Argon 设为 1M）
+# 3. 针对指定模型独立配置（例如仅将 Argon / Carbon 设为 1M）
 python scripts/manage_token_limit.py --set 1m --model argon
+python scripts/manage_token_limit.py --set 1m --model carbon
 
-# 4. 恢复官方默认基线 (Flash 128K, Argon 256K, Clamp 256K, Cloud Mendel 生效)
+# 4. 恢复官方默认基线 (Flash 128K, Argon/Carbon 256K, Clamp 256K, Cloud Mendel 生效)
 python scripts/manage_token_limit.py --restore
 ```
 > 注意：配置修改后，需完全退出并重启 Antigravity 应用程序以使新的上下文水印与限制生效。
