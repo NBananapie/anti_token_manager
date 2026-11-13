@@ -187,6 +187,8 @@ export default function App() {
   const getModelBadgeClass = (model: string) => {
     const m = model.toLowerCase();
     if (m.includes('claude')) return 'badge-claude';
+    if (m.includes('orchestrator')) return 'badge-orchestrator';
+    if (m.includes('hydrogen')) return 'badge-hydrogen';
     if (m.includes('carbon')) return 'badge-carbon';
     if (m.includes('argon')) return 'badge-argon';
     if (m.includes('flash-n')) return 'badge-flash-n';
@@ -586,6 +588,8 @@ export default function App() {
                 const mLow = model.toLowerCase();
                 let bg = '#3b82f6';
                 if (mLow.includes('claude')) bg = '#e11d48';
+                else if (mLow.includes('orchestrator')) bg = '#a21caf';
+                else if (mLow.includes('hydrogen')) bg = '#0284c7';
                 else if (mLow.includes('carbon')) bg = '#0f766e';
                 else if (mLow.includes('argon')) bg = '#4f46e5';
                 else if (mLow.includes('-n')) bg = '#10b981';

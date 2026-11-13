@@ -50,7 +50,7 @@ flowchart TD
 
 ### 2.1 零侵入底层端点探测
 - 采用 Node.js 原生 `node:sqlite` 并发只读模式读取本地数据库，完全兼容 WAL 机制，不产生文件锁，不干扰 Antigravity 正常对话执行。
-- 逐轮流式解码 `gen_metadata` 中的 Protobuf 原始二进制负载，提取字段 19 携带的真实物理模型端点标识（例如 `gemini-3.8-flash`、`gemini-3.8-flash-n`、`gemini-4-carbon`、`gemini-4-argon-trial`、`claude-opus-5-5-high` 等）。
+- 逐轮流式解码 `gen_metadata` 中的 Protobuf 原始二进制负载，提取字段 19 携带的真实物理模型端点标识（例如 `gemini-3.8-flash`、`gemini-4-hydrogen`、`gemini-4-carbon`、`gemini-4-argon`、`gemini-pro-orchestrator`、`claude-opus-5-5-high` 等）。
 
 ### 2.2 速率与性能多维指标审计
 - **流式输出速率 (Stream TPS)**：统计首字到达至输出完成期间的吐字速率（`responseTokens / streamSec`），排除网络预填充与思考推理耗时。
@@ -59,8 +59,8 @@ flowchart TD
 - **思维链分离核算**：清晰分离思考推理 Token（`thinkingTokens`）与正文可见 Token（`responseTokens`），展示模型推理占比。
 
 ### 2.3 双厂商全模型计费核算
-- 内置 Google Gemini（Flash / Carbon / Argon / Pro / Lite 系列）与 Anthropic Claude（Opus / Sonnet / Haiku 系列）官方价格模型与阶梯计费逻辑。
-- 支持基于本地价格缓存文件 `gemini_pricing.json` 与在线实时同步，核算输入 Token、缓存命中 Token 与输出 Token 支出明细。
+- 内置 Google Gemini（Carbon / Argon / Hydrogen / Orchestrator / Flash / Pro / Lite 系列）与 Anthropic Claude（Opus / Sonnet / Haiku 系列）官方价格模型与阶梯计费逻辑。
+- 支持 `Orchestrator (Carbon / Argon)` 编排会话按单步真实物理路由模型（如 `Carbon` 规划步与 `Hydrogen` 执行步）自动拆分计费，支持基于本地价格缓存文件 `gemini_pricing.json` 与在线实时同步。
 
 ### 2.4 主子会话递归穿透归集
 - 针对 Antigravity 派生的各类子代理（Subagents，如 `research`、`codebase-retriever`、`terminal` 等），自动化工具与 Web 大盘均支持通过 `parent_conversation_id` 进行递归穿透关联，避免遗漏后台子任务的资源消耗。
@@ -195,19 +195,21 @@ python scripts/analyze_compact.py --session <conversation-id>
 修改或检查 `language_server` 运行时的上下文最大 Token 限制（支持 128K、256K、320K、384K、512K、768K、1M / 840K）：
 
 ```bash
-# 1. 查看当前各模型上下文限制状态、机器码钳制与 Mendel 状态
+# 1. 查看当前静态 JSON 槽位、云端动态模型基线、机器码钳制与 Mendel 状态
 python scripts/manage_token_limit.py --status
 
-# 2. 将全部模型窗口升级至指定档位（例如 512K / 768K / 1M）
+# 2. 将全部静态与动态模型窗口升级至指定档位（例如 512K / 768K / 1M）
 python scripts/manage_token_limit.py --set 512k
 python scripts/manage_token_limit.py --set 768k
 python scripts/manage_token_limit.py --set 1m
 
-# 3. 针对指定模型独立配置（例如仅将 Argon / Carbon 设为 1M）
+# 3. 针对指定模型组配置（自动保护其他更高档位模型与动态基线不被截断）
+python scripts/manage_token_limit.py --set 512k --model flash
 python scripts/manage_token_limit.py --set 1m --model argon
-python scripts/manage_token_limit.py --set 1m --model carbon
+python scripts/manage_token_limit.py --set 1m --model hydrogen
+python scripts/manage_token_limit.py --set 1m --model orchestrator
 
-# 4. 恢复官方默认基线 (Flash 128K, Argon/Carbon 256K, Clamp 256K, Cloud Mendel 生效)
+# 4. 恢复官方默认基线（自动校验备份构建版本，跨版本升级时安全就地还原）
 python scripts/manage_token_limit.py --restore
 ```
 > 注意：配置修改后，需完全退出并重启 Antigravity 应用程序以使新的上下文水印与限制生效。

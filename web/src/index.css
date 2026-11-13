@@ -66,6 +66,16 @@ html, body, #root {
   color: #0f766e;
   border: 1px solid #99f6e4;
 }
+.badge-hydrogen {
+  background: #f0f9ff;
+  color: #0369a1;
+  border: 1px solid #bae6fd;
+}
+.badge-orchestrator {
+  background: #fdf4ff;
+  color: #86198f;
+  border: 1px solid #f5d0fe;
+}
 .badge-unknown {
   background: #f1f5f9;
   color: #475569;

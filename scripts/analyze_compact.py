@@ -190,7 +190,7 @@ def print_report(stats: dict[str, dict[str, list[Any]]]) -> None:
     print("\n" + line_sep)
     print("[Engineering Insights & Threshold Rules]")
     print("1. Compaction triggers immediately after instant context window (input_tokens + cache_read_tokens) crosses 100% of max_token_limit.")
-    print("2. Gemini 3.8 Flash, Gemini 4 Argon, and Gemini 4 Carbon evaluate against the configured max_token_limit at step completion.")
+    print("2. Static JSON models (Gemini 3.8 Flash M124, Argon M408, Claude 5.5 M400) and dynamic cloud models (Gemini 4 Hydrogen, Orchestrator, Carbon M427) all evaluate against max_token_limit at step completion.")
     print("3. For 1M context models (--set 1m / 840k), max_token_limit is 840,000 tokens (reserving 160K for MaxOutputTokens=65,536 and in-step tool growth).")
     print("4. Supported binary patch tiers via manage_token_limit.py: 128K, 256K, 320K, 384K, 512K, 768K, and 1M (840K safe cap).")
     print(line_sep + "\n")

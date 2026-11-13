@@ -23,6 +23,24 @@
     "cache_read": 0.1,
     "output": 10.0
   },
+  "gemini-4-hydrogen": {
+    "name": "Gemini 4 Hydrogen (Medium)",
+    "input": 1.5,
+    "cache_read": 0.075,
+    "output": 7.5
+  },
+  "gemini-pro-orchestrator": {
+    "name": "Orchestrator (Carbon)",
+    "input": 2.0,
+    "cache_read": 0.1,
+    "output": 10.0
+  },
+  "gemini-pro-orchestrator-argon": {
+    "name": "Orchestrator (Argon)",
+    "input": 2.0,
+    "cache_read": 0.1,
+    "output": 10.0
+  },
   "gemini-3.5-flash-lite": {
     "name": "Gemini 3.5 Flash-Lite",
     "input": 0.3,
@@ -34,6 +52,12 @@
     "input": 2.0,
     "cache_read": 0.2,
     "output": 12.0
+  },
+  "gpt-oss-120b": {
+    "name": "GPT-OSS 120B (Medium)",
+    "input": 0.15,
+    "cache_read": 0.075,
+    "output": 0.6
   },
   "claude-opus-5-5": {
     "name": "Claude Opus 5.5 (High)",

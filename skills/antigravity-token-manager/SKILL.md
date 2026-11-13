@@ -54,7 +54,8 @@ python3 scripts/analyze_tokens.py --period today --json
 * **Reporting Structure**: Always present the parent main agent metrics, each subagent's role and metrics, and the grand combined total to avoid undercounting background agent tasks.
 
 **Pricing Resolution**:
-* Uses built-in official fallback rates (`gemini-3.8-flash`, `gemini-4-carbon`, `gemini-4-argon`, `gemini-3.5-flash-lite`, `gemini-3.1-pro`).
+* Uses built-in official fallback rates (`gemini-4-carbon`, `gemini-4-argon`, `gemini-4-hydrogen`, `gemini-pro-orchestrator`, `gemini-pro-orchestrator-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro`, `claude-opus-5-5`, `claude-sonnet-5-5`, `gpt-oss-120b`).
+* `Orchestrator (Carbon)` and `Orchestrator (Argon)` sessions dynamically switch per step between planner models (`Carbon` / `Argon`: $2.00 / $0.10 cache / $10.00 output per 1M tokens) and execution models (`Gemini 4 Hydrogen`: $1.50 / $0.075 cache / $7.50 output per 1M tokens); SQLite `gen_metadata` attributes each step to the exact underlying model executed.
 * If pricing changes, sync via `--sync-pricing`, or retrieve current rates from Google Gemini API documentation and update `scripts/gemini_pricing.json`.
 
 ---
@@ -75,7 +76,7 @@ python3 scripts/analyze_compact.py --json
 ```
 
 **Key Metrics**:
-* **Context Window at Trigger**: `input_tokens + cache_read_tokens` at compaction moment (`CHECKPOINT` triggers immediately after crossing `100%` of `max_token_limit` for `Gemini 3.8 Flash`, `Gemini 4 Argon`, and `Gemini 4 Carbon`, e.g., `> 256,000` for `256K`, `> 512,000` for `512K`, and `> 840,000` for `1M (840K)`).
+* **Context Window at Trigger**: `input_tokens + cache_read_tokens` at compaction moment (`CHECKPOINT` triggers immediately after crossing `100%` of `max_token_limit` across `Gemini 3.8 Flash`, `Gemini 4 Hydrogen`, `Gemini 4 Argon`, `Gemini 4 Carbon`, and `Orchestrator` modes, e.g., `> 256,000` for `256K`, `> 512,000` for `512K`, and `> 840,000` for `1M (840K)`).
 * **Cumulative Flow**: Total accumulated token throughput between consecutive compaction events.
 * **Reduction Percentage**: Context size reduction achieved after compaction (typically 70% to 97%).
 
@@ -86,27 +87,28 @@ python3 scripts/analyze_compact.py --json
 Execute [`scripts/manage_token_limit.py`](scripts/manage_token_limit.py) to inspect and configure the language service binary:
 
 ```bash
-# 1. Check current token limits, machine-code clamps, and Mendel override status
+# 1. Check current token limits, dynamic model baseline, machine-code clamps, and Mendel override status
 python3 scripts/manage_token_limit.py --status
 
-# 2. Upgrade all models (Flash, Argon, and Carbon) to 256K, 320K, 384K, 512K, 768K, or 1M
+# 2. Upgrade all models (Flash, Hydrogen, Argon, Carbon, Orchestrator, Claude) to 256K..1M
 python3 scripts/manage_token_limit.py --set 256k
 python3 scripts/manage_token_limit.py --set 512k
 python3 scripts/manage_token_limit.py --set 768k
 python3 scripts/manage_token_limit.py --set 1m
 
-# 3. Target specific models independently (e.g. Flash 512K, Argon/Carbon 1M)
+# 3. Target specific model scopes (machine-code clamp auto-protects higher configured models)
 python3 scripts/manage_token_limit.py --set 512k --model flash
 python3 scripts/manage_token_limit.py --set 1m --model argon
-python3 scripts/manage_token_limit.py --set 1m --model carbon
+python3 scripts/manage_token_limit.py --set 1m --model hydrogen
+python3 scripts/manage_token_limit.py --set 1m --model orchestrator
 
-# 4. Restore official defaults: Flash 128K, Argon/Carbon 256K, Clamp 256K, Cloud Mendel Active
+# 4. Restore official defaults (build-matched backup check or safe in-place restore)
 python3 scripts/manage_token_limit.py --restore
 ```
 
 **Binary Patch Architecture (x86_64)**:
-* **`.rdata` `snapshotmendelfp` 12-Byte JSON Slots**: Updates the 2 `FLASH_PREFIX` and 3 `ARGON_PREFIX` (`MODEL_PLACEHOLDER_M408`, shared by `Gemini 4 Argon` and `Gemini 4 Carbon`) `max_token_limit` slots in-place without shifting binary offsets. For `--set 1m` (or `840k`), `max_token_limit` is set to `840000` (`840K`, matching Google's built-in `claude-1m_840k` profile) so it passes `ValidateCheckpointConfig` (`MaxTokenLimit <= MaxTokens - MaxOutputTokens`, i.e. `840,000 <= 1,000,000 - 65,536 = 934,464`) and reserves `160K` tokens for single-turn tool output growth and checkpoint summarization.
-* **Pattern 1 & 2 (`GetCheckpointConfigForModelInfo`)**: Raises the 3 hardcoded `uint32` fallback constants (`0x3e800 -> target`) and replaces `cmovb` (`0f 42 f2`) with `nop` (`90 90 90`) when `limit > 256K`.
+* **`.rdata` `snapshotmendelfp` 12-Byte JSON Slots**: Updates the static `M124` (`Gemini 3.8 Flash`), `M400` (`Claude 5.5`), `M408` (`Gemini 4 Argon / Carbon`), and legacy `FLASH_PREFIX` `max_token_limit` slots in-place without shifting binary offsets. For `--set 1m` (or `840k`), `max_token_limit` is set to `840000` (`840K`, matching Google's built-in `claude-1m_840k` profile) so it passes `ValidateCheckpointConfigForModelInfo` (`MaxTokenLimit <= MaxTokens - MaxOutputTokens`, i.e. `840,000 <= 1,000,000 - 65,536 = 934,464`) and reserves `160K` tokens for single-turn tool output growth and checkpoint summarization.
+* **Pattern 1 & 2 (`utils.GetCheckpointConfig` + `ClampCheckpointConfigForModelInfo`)**: Raises the 3 hardcoded `uint32` baseline/clamp constants (`0x3e800 -> target`) and replaces `cmovb` (`0f 42 f2`) with `nop` (`90 90 90`) when `limit > 256K`. Cloud-pushed dynamic models not listed in static `snapshotmendelfp["models"]` — including `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`, `Orchestrator (Carbon / Argon)`, and `Gemini 4 Carbon (M427)` — inherit this `Pattern 1` baseline directly while `ClampCheckpointConfigForModelInfo` automatically caps to `min(limit, modelInfo.MaxTokens - reserve)`.
 * **Pattern 3 (`(*overlayFeatureProvider).GetProto`)**: Patches `74 29 -> eb 29` so `CASCADE_USE_EXPERIMENT_CHECKPOINTER` Protobuf lookups always read from local `p.base` (`snapshotmendelfp`) instead of cloud `MendelStateCache`.
 * **Pattern 4 (`(*snapshotFallbackFactory).NewProvider`)**: Patches `74 57 -> 90 90` after `HasNoCCPAAccess()` so authenticated sessions always construct `overlayFeatureProvider(base=snapshotmendelfp, overlay=liveMendelStateCache)` rather than short-circuiting to pure cloud `*MendelAdapter`.
 

@@ -2,7 +2,8 @@
 """
 Antigravity Context Token Limit Manager CLI
 Configures max_token_limit thresholds (128K, 256K, 320K, 384K, 512K, 768K, 1M) for language_server.
-Supports updating all models simultaneously or targeting specific models (Flash, Argon, Carbon).
+Supports updating all models simultaneously or targeting specific model groups
+(Flash, Argon, Carbon, Hydrogen, Orchestrator).
 Cross-platform compatible: macOS (ARM64) and Windows (x86_64).
 Zero-dependency using Python standard library.
 """
@@ -25,6 +26,24 @@ IS_MACOS = sys.platform == "darwin"
 # is never matched or overwritten.
 FLASH_PREFIX = rb'"CASCADE_USE_EXPERIMENT_CHECKPOINTER": "{\n    \"strategy\": \"CHECKPOINT_STRATEGY_SINGLE_PROMPT\",\n    \"max_token_limit\"'
 ARGON_PREFIX = rb'"CASCADE_USE_EXPERIMENT_CHECKPOINTER": "{\n    \"strategy\": \"CHECKPOINT_STRATEGY_SAME_MODEL\",\n    \"max_token_limit\"'
+
+# Profile-anchored prefixes inside snapshotmendelfp.model_profiles:
+# - M124: Gemini 3.8 Flash (M317..M322 -> M124)
+# - M400: Claude Opus/Sonnet 5.5 base slot (M400..M405 -> M400)
+# - M408: Static Gemini 4 Argon / Carbon slots (M408..M431 -> M408)
+# Note: Cloud-pushed models not in snapshotmendelfp.models — including Gemini 4 Hydrogen
+# (Low/Medium/High/XHigh), Orchestrator (Carbon / Argon), and Gemini 4 Carbon (M427) —
+# bypass JSON slots and inherit the machine-code baseline in utils.GetCheckpointConfig (Pattern 1 & 2),
+# clamped safely at runtime by ClampCheckpointConfigForModelInfo to min(limit, MaxTokens - reserve).
+M124_FLASH38_PREFIX = (
+    b'"MODEL_PLACEHOLDER_M124": {\n      ' + ARGON_PREFIX
+)
+M400_CLAUDE_PREFIX = (
+    b'"MODEL_PLACEHOLDER_M400": {\n      ' + ARGON_PREFIX
+)
+M408_GEMINI4_PREFIX = (
+    b'"MODEL_PLACEHOLDER_M408": {\n      ' + ARGON_PREFIX
+)
 SLOT_BYTE_LEN = 12
 
 # Note on 1M context window models ('1m' / '840k'):
@@ -385,6 +404,37 @@ def replace_binary_clamp(data: bytes, limit_key: str, restore_overlay: bool = Fa
     return bytes(out), count, arch
 
 
+def _is_backup_compatible(target_data: bytes, backup_data: bytes) -> bool:
+    """
+    Verify that backup_data belongs to the exact same language_server build as target_data.
+    Checks exact byte size and immutable executable headers (PE COFF TimeDateStamp / Mach-O header)
+    in the first 4096 bytes before .text patch offsets.
+    """
+    if len(target_data) != len(backup_data) or len(target_data) < 4096:
+        return False
+    return target_data[:4096] == backup_data[:4096]
+
+
+def _inspect_slot_int_values(data: bytes, prefix: bytes) -> list[int]:
+    """Return integer token limits extracted from all matching JSON slots for prefix."""
+    pos = 0
+    nums: list[int] = []
+    while True:
+        idx = data.find(prefix, pos)
+        if idx == -1:
+            break
+        val_start = idx + len(prefix)
+        slot = data[val_start : val_start + SLOT_BYTE_LEN]
+        val = _extract_slot_digits(slot)
+        if val is not None:
+            try:
+                nums.append(int(val.decode("ascii")))
+            except ValueError:
+                pass
+        pos = val_start + SLOT_BYTE_LEN
+    return nums
+
+
 def _cleanup_stale_old_binaries(target_path: str) -> None:
     """Remove unlocked stale language_server.exe.old* files left from previous online atomic updates."""
     if not IS_WINDOWS:
@@ -406,47 +456,85 @@ def check_status(target_path: str, backup_path: str) -> bool:
     with open(target_path, "rb") as fp:
         data = fp.read()
 
-    flash_val, flash_count = inspect_model_values(data, FLASH_PREFIX)
-    argon_val, argon_count = inspect_model_values(data, ARGON_PREFIX)
+    backup_state = "No"
+    if os.path.exists(backup_path):
+        try:
+            with open(backup_path, "rb") as bfp:
+                b_head = bfp.read(4096)
+            b_size = os.path.getsize(backup_path)
+            if b_size == len(data) and len(data) >= 4096 and data[:4096] == b_head:
+                backup_state = f"Yes ({backup_path}, build matched)"
+            else:
+                backup_state = f"Stale ({backup_path}, different binary build — will use safe in-place operations)"
+        except Exception:
+            backup_state = f"Yes ({backup_path})"
+
+    flash38_val, flash38_count = inspect_model_values(data, M124_FLASH38_PREFIX)
+    m408_val, m408_count = inspect_model_values(data, M408_GEMINI4_PREFIX)
+    m400_val, m400_count = inspect_model_values(data, M400_CLAUDE_PREFIX)
+    legacy_flash_val, legacy_flash_count = inspect_model_values(data, FLASH_PREFIX)
+    argon_all_val, argon_all_count = inspect_model_values(data, ARGON_PREFIX)
     clamp_status, clamp_vals, clamp_arch, is_unclamped = inspect_binary_clamp(data)
     overlay_found, overlay_bypassed = inspect_mendel_overlay(data)
 
-    line_sep = "=" * 60
+    line_sep = "=" * 68
     print(line_sep)
     print("Antigravity Language Server Token Limit Status")
     print(line_sep)
     print(f"Platform: {sys.platform} ({clamp_arch})")
     print(f"Target file: {target_path}")
     print(f"File size: {len(data):,} bytes")
-    print(f"Backup exists: {'Yes (' + backup_path + ')' if os.path.exists(backup_path) else 'No'}")
+    print(f"Backup exists: {backup_state}")
 
-    flash_key = flash_val.lower()
-    argon_key = argon_val.lower()
-    flash_trig = TRIGGER_THRESHOLDS.get(flash_key, "custom threshold")
-    argon_trig = TRIGGER_THRESHOLDS.get(argon_key, "custom threshold")
+    f38_disp = flash38_val if flash38_count > 0 else legacy_flash_val
+    m408_disp = m408_val if m408_count > 0 else argon_all_val
+    f38_trig = TRIGGER_THRESHOLDS.get(f38_disp.lower(), "custom threshold")
+    m408_trig = TRIGGER_THRESHOLDS.get(m408_disp.lower(), "custom threshold")
+    dyn_trig = TRIGGER_THRESHOLDS.get(clamp_status.lower(), "min(clamp, model.MaxTokens - reserve)")
 
-    print(f"\nModel Token Limits (JSON Config):")
-    print(f"  - Gemini 3.8 Flash:        {flash_val} ({flash_count} markers) -> trigger: {flash_trig}")
-    print(f"  - Gemini 4 Argon / Carbon: {argon_val} ({argon_count} markers) -> trigger: {argon_trig}")
+    print("\n1. Static JSON Model Profiles (snapshotmendelfp):")
+    if flash38_count > 0:
+        print(f"  - Gemini 3.8 Flash (M124):              {flash38_val} ({flash38_count} slot)  -> trigger: {f38_trig}")
+    if m408_count > 0:
+        print(f"  - Gemini 4 Argon / Carbon (M408):       {m408_val} ({m408_count} slot)  -> trigger: {m408_trig}")
+    elif argon_all_count > 0:
+        print(f"  - Gemini 4 Same-Model Profiles:         {argon_all_val} ({argon_all_count} slots) -> trigger: {m408_trig}")
+    if m400_count > 0:
+        print(f"  - Claude Opus / Sonnet 5.5 (M400):      {m400_val} (+ claude-1m_840k variant)")
+    if legacy_flash_count > 0:
+        print(f"  - Legacy Gemini 2.5 Flash/Pro:          {legacy_flash_val} ({legacy_flash_count} slots)")
+
+    print("\n2. Dynamic Cloud Models & Modes (utils.GetCheckpointConfig Baseline):")
+    if clamp_arch == "x86_64":
+        overlay_note = (
+            f"{clamp_status} -> trigger: {dyn_trig}"
+            if overlay_bypassed
+            else "Cloud Mendel Active [WARNING: Cloud MendelStateCache may override to 256K!]"
+        )
+        print(f"  - Gemini 4 Hydrogen (Low/Med/High/XHigh): {overlay_note}")
+        print(f"  - Orchestrator (Carbon / Argon):          {overlay_note}")
+        print(f"  - Gemini 4 Carbon (New M427):             {overlay_note}")
+    else:
+        print(f"  - Dynamic Models Fallback:                {clamp_status}")
 
     elevated_labels = ("320K", "384K", "512K", "768K", "840K", "1M", "1M (840K)")
-    print(f"\nBinary Clamp Status (Machine Code):")
+    print("\n3. Binary Clamp & Cloud Override Status (Machine Code):")
     if clamp_arch == "x86_64":
         if clamp_status.upper() in elevated_labels:
-            unclamp_tag = " [Hard Floor & Ceiling Locked: cmovb clamp bypassed]" if is_unclamped else ""
-            print(f"  - x86_64 Clamp: {clamp_status} ({len(clamp_vals)} locations patched){unclamp_tag} -> Hard ceiling raised successfully")
+            unclamp_tag = " [cmovb clamp bypassed; ClampCheckpointConfigForModelInfo safe-guards window]" if is_unclamped else ""
+            print(f"  - x86_64 Clamp: {clamp_status} ({len(clamp_vals)} locations patched){unclamp_tag}")
         elif clamp_status.upper() == "256K":
-            if flash_val.upper() in elevated_labels or argon_val.upper() in elevated_labels:
-                print(f"  - x86_64 Clamp: 256K [WARNING: Hard ceiling clamp active at 256K; will truncate models configured for >256K!]")
+            if f38_disp.upper() in elevated_labels or m408_disp.upper() in elevated_labels:
+                print("  - x86_64 Clamp: 256K [WARNING: Hard ceiling clamp active at 256K; will truncate models configured for >256K!]")
             else:
-                print(f"  - x86_64 Clamp: 256K (Official default baseline)")
+                print("  - x86_64 Clamp: 256K (Official default baseline)")
         else:
             print(f"  - x86_64 Clamp: {clamp_status} (Values: {clamp_vals})")
         if overlay_found:
             if overlay_bypassed:
-                print("  - Cloud Mendel Override: Bypassed (eb 29 + 90 90 -> Local snapshotmendelfp config authoritative)")
+                print("  - Cloud Mendel Override: Bypassed (eb 29 + 90 90 -> Local config & Pattern 1 authoritative)")
             else:
-                print("  - Cloud Mendel Override: Active (74 29 / 74 57) [WARNING: Cloud MendelStateCache will override local JSON limits to 256K!]")
+                print("  - Cloud Mendel Override: Active (74 29 / 74 57) [WARNING: Cloud MendelStateCache will override local limits to 256K!]")
     else:
         print(f"  - Status: {clamp_status}")
 
@@ -470,8 +558,8 @@ def set_token_limit(
 ) -> None:
     """
     Set max_token_limit to 128k, 256k, 320k, 384k, 512k, 768k, 840k, or 1m (maps to 840K safe ceiling).
-    Can update all models simultaneously or target 'flash', 'argon', or 'carbon' specifically.
-    Automatically synchronizes machine-code clamp limits to prevent truncation.
+    Can update all models simultaneously or target 'flash', 'argon', 'carbon', 'hydrogen', or 'orchestrator'.
+    Protects shared machine-code baseline from accidental downward truncation when updating a single JSON profile.
     """
     _cleanup_stale_old_binaries(target_path)
     limit_key = limit.lower()
@@ -479,55 +567,112 @@ def set_token_limit(
         print(f"Error: Unsupported limit '{limit}'. Choose from: 128k, 256k, 320k, 384k, 512k, 768k, 840k, 1m.")
         sys.exit(1)
 
+    valid_scopes = ("all", "flash", "argon", "carbon", "hydrogen", "orchestrator")
     model_target = model.lower()
-    if model_target not in ("all", "flash", "argon", "carbon"):
-        print(f"Error: Unsupported model scope '{model}'. Choose from: 'all', 'flash', 'argon', 'carbon'.")
+    if model_target not in valid_scopes:
+        print(f"Error: Unsupported model scope '{model}'. Choose from: {', '.join(valid_scopes)}.")
         sys.exit(1)
 
     if not os.path.exists(target_path):
         print(f"Error: Target file not found: {target_path}")
         sys.exit(1)
 
-    # 1. Ensure original baseline backup exists
-    if not os.path.exists(backup_path):
-        print(f"Creating original binary backup: {backup_path} ...")
-        shutil.copy2(target_path, backup_path)
-        print("Backup created successfully.")
-
-    # 2. Read target binary
+    # 1. Read target binary first and verify/create build-matched backup
     with open(target_path, "rb") as fp:
         data = fp.read()
 
+    need_backup = not os.path.exists(backup_path)
+    if not need_backup:
+        try:
+            with open(backup_path, "rb") as bfp:
+                bdata = bfp.read()
+            if not _is_backup_compatible(data, bdata):
+                _, cur_clamp_vals, _, cur_unclamped = inspect_binary_clamp(data)
+                _, cur_bypassed = inspect_mendel_overlay(data)
+                if not cur_unclamped and not cur_bypassed and set(cur_clamp_vals) in ({256000}, set()):
+                    print(f"Refreshing stale backup to match updated language_server build: {backup_path} ...")
+                    need_backup = True
+                else:
+                    print("Notice: Existing backup belongs to an older language_server build; preserving current state without overwriting.")
+        except Exception:
+            pass
+
+    if need_backup:
+        print(f"Creating binary backup: {backup_path} ...")
+        shutil.copy2(target_path, backup_path)
+        print("Backup created successfully.")
+
     new_val_bytes = SUPPORTED_LIMITS[limit_key]
+    target_int = SUPPORTED_LIMITS_INT[limit_key]
     display_lbl = VALUE_TO_LABEL.get(new_val_bytes, limit_key.upper())
     updated_data = data
     summary_messages: list[str] = []
 
-    # Apply to Flash
-    if model_target in ("all", "flash"):
-        updated_data, c_flash = replace_model_limit(updated_data, FLASH_PREFIX, new_val_bytes)
-        summary_messages.append(f"Gemini 3.8 Flash: updated {c_flash} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})")
-
-    # Apply to Argon / Carbon (shared Gemini 4 CHECKPOINT_STRATEGY_SAME_MODEL slots in snapshotmendelfp)
-    if model_target in ("all", "argon", "carbon"):
-        updated_data, c_argon = replace_model_limit(updated_data, ARGON_PREFIX, new_val_bytes)
+    # 2. Update targeted JSON slots
+    if model_target == "all":
+        updated_data, c_flash_leg = replace_model_limit(updated_data, FLASH_PREFIX, new_val_bytes)
+        updated_data, c_same = replace_model_limit(updated_data, ARGON_PREFIX, new_val_bytes)
         summary_messages.append(
-            f"Gemini 4 Argon / Carbon: updated {c_argon} JSON markers to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})"
+            f"All Static JSON Profiles (Flash 3.8 M124, Argon/Carbon M408, Claude M400, Legacy 2.5): "
+            f"updated {c_flash_leg + c_same} slots to {display_lbl}"
+        )
+    elif model_target == "flash":
+        updated_data, c_m124 = replace_model_limit(updated_data, M124_FLASH38_PREFIX, new_val_bytes)
+        updated_data, c_leg = replace_model_limit(updated_data, FLASH_PREFIX, new_val_bytes)
+        summary_messages.append(
+            f"Gemini 3.8 Flash (M124) & Legacy Flash: updated {c_m124 + c_leg} JSON slots to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})"
+        )
+    elif model_target in ("argon", "carbon"):
+        updated_data, c_m408 = replace_model_limit(updated_data, M408_GEMINI4_PREFIX, new_val_bytes)
+        if c_m408 == 0:
+            updated_data, c_m408 = replace_model_limit(updated_data, ARGON_PREFIX, new_val_bytes)
+        summary_messages.append(
+            f"Gemini 4 Argon / Carbon (M408 JSON): updated {c_m408} slot(s) to {display_lbl} ({TRIGGER_THRESHOLDS[limit_key]})"
         )
 
-    # Apply Machine-Code Clamp Patch
-    updated_data, c_clamp, c_arch = replace_binary_clamp(updated_data, limit_key)
+    # 3. Determine safe Machine-Code Clamp & Dynamic Model Baseline (Pattern 1..4)
+    # Cloud-pushed models (Hydrogen, Orchestrator, Carbon M427) rely directly on Pattern 1.
+    # Also, Pattern 1 must never be lower than the highest active JSON slot, otherwise it would truncate that JSON slot.
+    _, existing_clamp_vals, _, _ = inspect_binary_clamp(updated_data)
+    cur_clamp_max = max(existing_clamp_vals) if existing_clamp_vals else 256000
+    all_json_ints = (
+        _inspect_slot_int_values(updated_data, FLASH_PREFIX)
+        + _inspect_slot_int_values(updated_data, M124_FLASH38_PREFIX)
+        + _inspect_slot_int_values(updated_data, M408_GEMINI4_PREFIX)
+    )
+    max_json_int = max(all_json_ints) if all_json_ints else 256000
+
+    if model_target in ("all", "carbon", "hydrogen", "orchestrator"):
+        desired_clamp_int = max(target_int, max_json_int)
+        if desired_clamp_int > target_int:
+            summary_messages.append(
+                f"Notice: Machine-code baseline kept at {INT_TO_LABEL.get(desired_clamp_int, str(desired_clamp_int))} "
+                f"to avoid truncating higher static JSON profile ({INT_TO_LABEL.get(max_json_int, str(max_json_int))}); "
+                f"use '--model all' to lower all models together."
+            )
+    else:
+        # 'flash' or 'argon' only: raise clamp if needed, but NEVER lower existing dynamic baseline (protects Hydrogen/Orchestrator/M427)
+        desired_clamp_int = max(target_int, cur_clamp_max, max_json_int)
+
+    int_to_key = {v: k for k, v in SUPPORTED_LIMITS_INT.items() if k != "840k"}
+    clamp_key = int_to_key.get(desired_clamp_int, limit_key)
+    clamp_disp = INT_TO_LABEL.get(desired_clamp_int, clamp_key.upper())
+
+    updated_data, c_clamp, c_arch = replace_binary_clamp(updated_data, clamp_key)
     if c_clamp > 0:
-        summary_messages.append(f"Binary Clamp ({c_arch}): patched {c_clamp} machine-code clamp locations to {display_lbl}")
+        summary_messages.append(
+            f"Dynamic Models & Binary Clamp ({c_arch} — Hydrogen / Orchestrator / Carbon M427): "
+            f"patched {c_clamp} locations to {clamp_disp}"
+        )
 
     if len(updated_data) != len(data):
         print("Error: Modified binary size mismatch. Aborting for safety!")
         sys.exit(1)
 
-    # 3. Write modified binary
+    # 4. Write modified binary
     _atomic_write_binary(target_path, updated_data)
 
-    # 4. Re-sign binary on macOS
+    # 5. Re-sign binary on macOS
     if IS_MACOS:
         print("Re-signing binary (codesign -f -s -) ...")
         try:
@@ -576,37 +721,51 @@ def _atomic_write_binary(target_path: str, data: bytes) -> None:
 
 
 def restore_official_defaults(target_path: str, backup_path: str) -> None:
-    """Restore official default baseline (Flash 128K, Argon 256K, Clamp 256K) from backup or in-place."""
+    """Restore official default baseline (Legacy Flash 128K, Same-Model 256K, Clamp 256K) from build-matched backup or in-place."""
     _cleanup_stale_old_binaries(target_path)
+    if not os.path.exists(target_path):
+        print(f"Error: Target file not found: {target_path}")
+        sys.exit(1)
+
+    with open(target_path, "rb") as fp:
+        cur_d = fp.read()
+
     if os.path.exists(backup_path):
         with open(backup_path, "rb") as fp:
             bdata = fp.read()
-        f_val, _ = inspect_model_values(bdata, FLASH_PREFIX)
-        a_val, _ = inspect_model_values(bdata, ARGON_PREFIX)
-        c_status, _, _, _ = inspect_binary_clamp(bdata)
-        if f_val == "128K" and a_val == "256K" and c_status == "256K":
-            print(f"Restoring clean binary from official backup: {backup_path} -> {target_path} ...")
-            _atomic_write_binary(target_path, bdata)
-            if IS_MACOS:
-                print("Verifying official signature ...")
-                try:
-                    subprocess.check_call(["codesign", "-v", target_path])
-                    print("Official signature valid.")
-                except Exception:
-                    print("Re-applying ad-hoc signature ...")
-                    subprocess.call(["codesign", "-f", "-s", "-", target_path])
-            print("Successfully restored official baseline: Flash 128K (~108.8K trigger), Argon 256K (256K trigger), Clamp 256K.")
-            print("Please restart the Antigravity application.")
-            return
+        if _is_backup_compatible(cur_d, bdata):
+            f_val, _ = inspect_model_values(bdata, FLASH_PREFIX)
+            a_val, _ = inspect_model_values(bdata, ARGON_PREFIX)
+            c_status, _, _, _ = inspect_binary_clamp(bdata)
+            if f_val == "128K" and a_val == "256K" and c_status == "256K":
+                print(f"Restoring clean binary from build-matched official backup: {backup_path} -> {target_path} ...")
+                _atomic_write_binary(target_path, bdata)
+                if IS_MACOS:
+                    print("Verifying official signature ...")
+                    try:
+                        subprocess.check_call(["codesign", "-v", target_path])
+                        print("Official signature valid.")
+                    except Exception:
+                        print("Re-applying ad-hoc signature ...")
+                        subprocess.call(["codesign", "-f", "-s", "-", target_path])
+                print("Successfully restored official baseline: Legacy Flash 128K, Gemini 3.8/4 & Dynamic Models 256K, Cloud Mendel Active.")
+                print("Please restart the Antigravity application.")
+                return
+        else:
+            print("Notice: Backup file belongs to a different language_server build; performing safe in-place restore instead of overwriting binary.")
 
-    # Fallback to in-place replacement
-    set_token_limit(target_path, backup_path, limit="128k", model="flash")
-    set_token_limit(target_path, backup_path, limit="256k", model="argon")
-    # Clamp and Mendel overlay restore to official baseline
-    with open(target_path, "rb") as fp:
-        cur_d = fp.read()
-    cur_d, _, _ = replace_binary_clamp(cur_d, "256k", restore_overlay=True)
-    _atomic_write_binary(target_path, cur_d)
+    # Safe in-place restore on current binary build
+    restored, _ = replace_model_limit(cur_d, FLASH_PREFIX, SUPPORTED_LIMITS["128k"])
+    restored, _ = replace_model_limit(restored, ARGON_PREFIX, SUPPORTED_LIMITS["256k"])
+    restored, _, _ = replace_binary_clamp(restored, "256k", restore_overlay=True)
+    if len(restored) != len(cur_d):
+        print("Error: Restored binary size mismatch. Aborting for safety!")
+        sys.exit(1)
+    _atomic_write_binary(target_path, restored)
+    if IS_MACOS:
+        subprocess.call(["codesign", "-f", "-s", "-", target_path])
+    print("Successfully restored official baseline in-place: Legacy Flash 128K, Gemini 3.8/4 & Dynamic Models 256K, Cloud Mendel Active.")
+    print("Please restart the Antigravity application.")
 
 
 def main() -> None:
@@ -624,9 +783,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        choices=["all", "flash", "argon", "carbon"],
+        choices=["all", "flash", "argon", "carbon", "hydrogen", "orchestrator"],
         default="all",
-        help="Model scope to apply the limit: 'all' (default, updates all models), 'flash' (Flash only), or 'argon'/'carbon' (Gemini 4 Argon & Carbon)",
+        help=(
+            "Model scope to apply the limit: 'all' (default, updates all static & dynamic models), "
+            "'flash' (Gemini 3.8 Flash M124), 'argon' (M408), or 'carbon'/'hydrogen'/'orchestrator'"
+        ),
     )
     parser.add_argument(
         "--patch",
