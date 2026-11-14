@@ -44,6 +44,12 @@ M400_CLAUDE_PREFIX = (
 M408_GEMINI4_PREFIX = (
     b'"MODEL_PLACEHOLDER_M408": {\n      ' + ARGON_PREFIX
 )
+M432_PREFIX = (
+    b'"MODEL_PLACEHOLDER_M432": {\n      ' + ARGON_PREFIX
+)
+M667_PREFIX = (
+    b'"MODEL_PLACEHOLDER_M667": {\n      ' + ARGON_PREFIX
+)
 SLOT_BYTE_LEN = 12
 
 # Note on 1M context window models ('1m' / '840k'):
@@ -131,11 +137,27 @@ X86_OVERLAY_P3_JMP = b"\xeb\x29"
 X86_OVERLAY_P3_SUFFIX = b"\x48\x8b\x54\x24\x38\x4c\x8b\x42\x10\x48\x8b\x42\x18\x49\x8b\x50\x38"
 
 # Pattern 4: (*snapshotFallbackFactory).NewProvider HasNoCCPAAccess check bypass
-# mov rdx, [rax+0x28]; mov rax, [rdx]; call rax; test al, al; je +0x57 (74 57 -> 90 90); mov rdx, [rsp+0x40]; mov rsi, [rdx+0x10]
+# Legacy build: mov rdx, [rax+0x28]; mov rax, [rdx]; call rax; test al, al; je +0x57 (74 57 -> 90 90); mov rdx, [rsp+0x40]; mov rsi, [rdx+0x10]
+# Newer build:  mov rdx, [rax+0x38]; mov rax, [rdx]; call rax; test al, al; je +0x87 (0f 84 87 00 00 00 -> 6x 90); mov rax, [rsp+0x50]; mov rdx, [rax+0x40]; mov rcx, [rdx]
 X86_FALLBACK_P4_PREFIX = b"\x48\x8b\x50\x28\x48\x8b\x02\xff\xd0\x84\xc0"
 X86_FALLBACK_P4_JE = b"\x74\x57"
 X86_FALLBACK_P4_NOP = b"\x90\x90"
 X86_FALLBACK_P4_SUFFIX = b"\x48\x8b\x54\x24\x40\x48\x8b\x72\x10"
+
+X86_FALLBACK_P4_VARIANTS: tuple[tuple[bytes, bytes, bytes, bytes], ...] = (
+    (
+        b"\x48\x8b\x50\x38\x48\x8b\x02\xff\xd0\x84\xc0",
+        b"\x0f\x84\x87\x00\x00\x00",
+        b"\x90\x90\x90\x90\x90\x90",
+        b"\x48\x8b\x44\x24\x50\x48\x8b\x50\x40\x48\x8b\x0a",
+    ),
+    (
+        X86_FALLBACK_P4_PREFIX,
+        X86_FALLBACK_P4_JE,
+        X86_FALLBACK_P4_NOP,
+        X86_FALLBACK_P4_SUFFIX,
+    ),
+)
 
 
 def get_default_paths() -> tuple[str, str]:
@@ -310,27 +332,44 @@ def inspect_binary_clamp(data: bytes) -> tuple[str, list[int], str, bool]:
     return "Not found", [], "unknown", False
 
 
+def _find_fallback_p4(data: bytes | bytearray) -> tuple[int, bytes, bytes, bytes] | None:
+    """Locate (*snapshotFallbackFactory).NewProvider HasNoCCPAAccess branch across supported builds."""
+    for prefix, je_bytes, nop_bytes, suffix in X86_FALLBACK_P4_VARIANTS:
+        idx = data.find(prefix + je_bytes + suffix)
+        if idx != -1:
+            return idx + len(prefix), je_bytes, nop_bytes, je_bytes
+        idx = data.find(prefix + nop_bytes + suffix)
+        if idx != -1:
+            return idx + len(prefix), je_bytes, nop_bytes, nop_bytes
+    return None
+
+
+def inspect_mendel_overlay_details(data: bytes) -> tuple[bool, bool, bool, bool]:
+    """
+    Inspect (*overlayFeatureProvider).GetProto (P3) and (*snapshotFallbackFactory).NewProvider (P4)
+    cloud MendelStateCache override status.
+    Returns: (p3_found, p3_bypassed, p4_found, p4_bypassed)
+    """
+    pat3_je = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JE + X86_OVERLAY_P3_SUFFIX
+    pat3_jmp = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JMP + X86_OVERLAY_P3_SUFFIX
+
+    p3_bypassed = data.find(pat3_jmp) != -1
+    p3_found = p3_bypassed or (data.find(pat3_je) != -1)
+
+    p4_match = _find_fallback_p4(data)
+    p4_found = p4_match is not None
+    p4_bypassed = p4_match is not None and p4_match[3] == p4_match[2]
+    return p3_found, p3_bypassed, p4_found, p4_bypassed
+
+
 def inspect_mendel_overlay(data: bytes) -> tuple[bool, bool]:
     """
     Inspect (*overlayFeatureProvider).GetProto and (*snapshotFallbackFactory).NewProvider
     cloud MendelStateCache override status.
     Returns: (pattern_found, is_bypassed)
     """
-    pat3_je = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JE + X86_OVERLAY_P3_SUFFIX
-    pat3_jmp = X86_OVERLAY_P3_PREFIX + X86_OVERLAY_P3_JMP + X86_OVERLAY_P3_SUFFIX
-    pat4_je = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_JE + X86_FALLBACK_P4_SUFFIX
-    pat4_nop = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_NOP + X86_FALLBACK_P4_SUFFIX
-
-    p3_bypassed = data.find(pat3_jmp) != -1
-    p3_found = p3_bypassed or (data.find(pat3_je) != -1)
-    p4_bypassed = data.find(pat4_nop) != -1
-    p4_found = p4_bypassed or (data.find(pat4_je) != -1)
-
-    if p3_found and p4_found:
-        return True, (p3_bypassed and p4_bypassed)
-    if p3_found:
-        return True, p3_bypassed
-    return False, False
+    p3_found, p3_bypassed, p4_found, p4_bypassed = inspect_mendel_overlay_details(data)
+    return (p3_found or p4_found), (p3_found and p4_found and p3_bypassed and p4_bypassed)
 
 
 def replace_binary_clamp(data: bytes, limit_key: str, restore_overlay: bool = False) -> tuple[bytes, int, str]:
@@ -389,15 +428,10 @@ def replace_binary_clamp(data: bytes, limit_key: str, restore_overlay: bool = Fa
         count += 1
 
     # 4. Patch x86_64 Pattern 4: (*snapshotFallbackFactory).NewProvider HasNoCCPAAccess check
-    pat4_je = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_JE + X86_FALLBACK_P4_SUFFIX
-    pat4_nop = X86_FALLBACK_P4_PREFIX + X86_FALLBACK_P4_NOP + X86_FALLBACK_P4_SUFFIX
-    idx4 = out.find(pat4_je)
-    if idx4 == -1:
-        idx4 = out.find(pat4_nop)
-    if idx4 != -1:
-        br4_start = idx4 + len(X86_FALLBACK_P4_PREFIX)
-        br4_end = br4_start + 2
-        out[br4_start:br4_end] = X86_FALLBACK_P4_JE if restore_overlay else X86_FALLBACK_P4_NOP
+    p4_match = _find_fallback_p4(out)
+    if p4_match is not None:
+        br4_start, p4_je, p4_nop, _ = p4_match
+        out[br4_start : br4_start + len(p4_je)] = p4_je if restore_overlay else p4_nop
         count += 1
 
     arch = "x86_64" if count > 0 else "unknown"
@@ -472,10 +506,14 @@ def check_status(target_path: str, backup_path: str) -> bool:
     flash38_val, flash38_count = inspect_model_values(data, M124_FLASH38_PREFIX)
     m408_val, m408_count = inspect_model_values(data, M408_GEMINI4_PREFIX)
     m400_val, m400_count = inspect_model_values(data, M400_CLAUDE_PREFIX)
+    m432_val, m432_count = inspect_model_values(data, M432_PREFIX)
+    m667_val, m667_count = inspect_model_values(data, M667_PREFIX)
     legacy_flash_val, legacy_flash_count = inspect_model_values(data, FLASH_PREFIX)
     argon_all_val, argon_all_count = inspect_model_values(data, ARGON_PREFIX)
     clamp_status, clamp_vals, clamp_arch, is_unclamped = inspect_binary_clamp(data)
-    overlay_found, overlay_bypassed = inspect_mendel_overlay(data)
+    p3_found, p3_bypassed, p4_found, p4_bypassed = inspect_mendel_overlay_details(data)
+    overlay_found = p3_found or p4_found
+    overlay_bypassed = p3_found and p4_found and p3_bypassed and p4_bypassed
 
     line_sep = "=" * 68
     print(line_sep)
@@ -501,6 +539,10 @@ def check_status(target_path: str, backup_path: str) -> bool:
         print(f"  - Gemini 4 Same-Model Profiles:         {argon_all_val} ({argon_all_count} slots) -> trigger: {m408_trig}")
     if m400_count > 0:
         print(f"  - Claude Opus / Sonnet 5.5 (M400):      {m400_val} (+ claude-1m_840k variant)")
+    if m432_count > 0:
+        print(f"  - Model Profile (M432):                 {m432_val} ({m432_count} slot)")
+    if m667_count > 0:
+        print(f"  - Model Profile (M667):                 {m667_val} ({m667_count} slot)")
     if legacy_flash_count > 0:
         print(f"  - Legacy Gemini 2.5 Flash/Pro:          {legacy_flash_val} ({legacy_flash_count} slots)")
 
@@ -532,9 +574,13 @@ def check_status(target_path: str, backup_path: str) -> bool:
             print(f"  - x86_64 Clamp: {clamp_status} (Values: {clamp_vals})")
         if overlay_found:
             if overlay_bypassed:
-                print("  - Cloud Mendel Override: Bypassed (eb 29 + 90 90 -> Local config & Pattern 1 authoritative)")
+                print("  - Cloud Mendel Override: Bypassed (eb 29 + P4 nop -> Local config & Pattern 1 authoritative)")
+            elif p3_found and p3_bypassed and not p4_found:
+                print("  - Cloud Mendel Override: Partial (P3 bypassed, P4 signature not matched in this build) [WARNING: Authenticated sessions may still be overridden!]")
+            elif p3_found and p3_bypassed and not p4_bypassed:
+                print("  - Cloud Mendel Override: Partial (P3 bypassed, P4 still active) [WARNING: Authenticated sessions may still be overridden!]")
             else:
-                print("  - Cloud Mendel Override: Active (74 29 / 74 57) [WARNING: Cloud MendelStateCache will override local limits to 256K!]")
+                print("  - Cloud Mendel Override: Active [WARNING: Cloud MendelStateCache will override local limits to 256K!]")
     else:
         print(f"  - Status: {clamp_status}")
 
@@ -637,8 +683,7 @@ def set_token_limit(
     cur_clamp_max = max(existing_clamp_vals) if existing_clamp_vals else 256000
     all_json_ints = (
         _inspect_slot_int_values(updated_data, FLASH_PREFIX)
-        + _inspect_slot_int_values(updated_data, M124_FLASH38_PREFIX)
-        + _inspect_slot_int_values(updated_data, M408_GEMINI4_PREFIX)
+        + _inspect_slot_int_values(updated_data, ARGON_PREFIX)
     )
     max_json_int = max(all_json_ints) if all_json_ints else 256000
 
@@ -736,8 +781,12 @@ def restore_official_defaults(target_path: str, backup_path: str) -> None:
         if _is_backup_compatible(cur_d, bdata):
             f_val, _ = inspect_model_values(bdata, FLASH_PREFIX)
             a_val, _ = inspect_model_values(bdata, ARGON_PREFIX)
-            c_status, _, _, _ = inspect_binary_clamp(bdata)
-            if f_val == "128K" and a_val == "256K" and c_status == "256K":
+            m408_val, m408_cnt = inspect_model_values(bdata, M408_GEMINI4_PREFIX)
+            c_status, _, _, b_unclamped = inspect_binary_clamp(bdata)
+            p3_f, p3_b, p4_f, p4_b = inspect_mendel_overlay_details(bdata)
+            any_bypassed = (p3_f and p3_b) or (p4_f and p4_b)
+            argon_ok = (m408_val == "256K") if m408_cnt > 0 else (a_val == "256K")
+            if f_val == "128K" and argon_ok and c_status == "256K" and not b_unclamped and not any_bypassed:
                 print(f"Restoring clean binary from build-matched official backup: {backup_path} -> {target_path} ...")
                 _atomic_write_binary(target_path, bdata)
                 if IS_MACOS:

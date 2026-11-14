@@ -19,6 +19,7 @@ All execution logic is self-contained in Python standard-library scripts under `
 | **Token & Cost Analyzer** | [`scripts/analyze_tokens.py`](scripts/analyze_tokens.py) | Scans all transcripts and SQLite databases to aggregate input, cache, thinking, and response tokens, output throughput (`tok/s`), TTFT latency, and Gemini + Claude API expenses across time intervals or by `--session`. |
 | **Compact Analyzer** | [`scripts/analyze_compact.py`](scripts/analyze_compact.py) | Computes empirical context compaction thresholds, interaction steps, post-compact reduction percentages by model, or step-by-step trajectory via `--session`. |
 | **Token Limit Manager** | [`scripts/manage_token_limit.py`](scripts/manage_token_limit.py) | Inspects status and configures `language_server`'s context window limits (`128K`, `256K`, `320K`, `384K`, `512K`, `768K`, `1M`) across `.rdata` JSON slots and 5 x86_64 machine-code clamp/override points. |
+| **Context Stress Tester** | [`scripts/stress_context.py`](scripts/stress_context.py) | Prepares deterministic read-only `read_file` stress payloads (`< 46KB` / `< 800` lines each), verifies subagent compaction ceilings from SQLite/transcript ground truth, and cleans up temporary payload files. |
 | **Pricing Core** | [`scripts/pricing.py`](scripts/pricing.py) | Houses official fallback Gemini & Claude rates, local cache (`gemini_pricing.json`), model enum/backend resolution, and online synchronization logic. |
 | **Transcript & Formatter** | [`scripts/transcript.py`](scripts/transcript.py), [`scripts/formatter.py`](scripts/formatter.py) | Single-pass streaming transcript/SQLite parser (extracting tokens, thinking/response splits, TTFT/streaming durations, and per-step models) and East Asian character-aware terminal table renderer. |
 
@@ -107,10 +108,39 @@ python3 scripts/manage_token_limit.py --restore
 ```
 
 **Binary Patch Architecture (x86_64)**:
-* **`.rdata` `snapshotmendelfp` 12-Byte JSON Slots**: Updates the static `M124` (`Gemini 3.8 Flash`), `M400` (`Claude 5.5`), `M408` (`Gemini 4 Argon / Carbon`), and legacy `FLASH_PREFIX` `max_token_limit` slots in-place without shifting binary offsets. For `--set 1m` (or `840k`), `max_token_limit` is set to `840000` (`840K`, matching Google's built-in `claude-1m_840k` profile) so it passes `ValidateCheckpointConfigForModelInfo` (`MaxTokenLimit <= MaxTokens - MaxOutputTokens`, i.e. `840,000 <= 1,000,000 - 65,536 = 934,464`) and reserves `160K` tokens for single-turn tool output growth and checkpoint summarization.
+* **`.rdata` `snapshotmendelfp` 12-Byte JSON Slots**: Updates the static `M124` (`Gemini 3.8 Flash`), `M400` (`Claude 5.5`), `M408` (`Gemini 4 Argon / Carbon`), `M432` / `M667` (newer builds), and legacy `FLASH_PREFIX` `max_token_limit` slots in-place without shifting binary offsets. For `--set 1m` (or `840k`), `max_token_limit` is set to `840000` (`840K`, matching Google's built-in `claude-1m_840k` profile) so it passes `ValidateCheckpointConfigForModelInfo` (`MaxTokenLimit <= MaxTokens - MaxOutputTokens`, i.e. `840,000 <= 1,000,000 - 65,536 = 934,464`) and reserves `160K` tokens for single-turn tool output growth and checkpoint summarization.
 * **Pattern 1 & 2 (`utils.GetCheckpointConfig` + `ClampCheckpointConfigForModelInfo`)**: Raises the 3 hardcoded `uint32` baseline/clamp constants (`0x3e800 -> target`) and replaces `cmovb` (`0f 42 f2`) with `nop` (`90 90 90`) when `limit > 256K`. Cloud-pushed dynamic models not listed in static `snapshotmendelfp["models"]` — including `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`, `Orchestrator (Carbon / Argon)`, and `Gemini 4 Carbon (M427)` — inherit this `Pattern 1` baseline directly while `ClampCheckpointConfigForModelInfo` automatically caps to `min(limit, modelInfo.MaxTokens - reserve)`.
 * **Pattern 3 (`(*overlayFeatureProvider).GetProto`)**: Patches `74 29 -> eb 29` so `CASCADE_USE_EXPERIMENT_CHECKPOINTER` Protobuf lookups always read from local `p.base` (`snapshotmendelfp`) instead of cloud `MendelStateCache`.
-* **Pattern 4 (`(*snapshotFallbackFactory).NewProvider`)**: Patches `74 57 -> 90 90` after `HasNoCCPAAccess()` so authenticated sessions always construct `overlayFeatureProvider(base=snapshotmendelfp, overlay=liveMendelStateCache)` rather than short-circuiting to pure cloud `*MendelAdapter`.
+* **Pattern 4 (`(*snapshotFallbackFactory).NewProvider`)**: Patches the `HasNoCCPAAccess()` short-circuit branch (`74 57 -> 90 90` in earlier builds; `0f 84 87 00 00 00 -> 6x 90` after `[rax+0x38]` in newer builds) so authenticated sessions always construct `overlayFeatureProvider(base=snapshotmendelfp, overlay=liveMendelStateCache)` rather than falling back to pure cloud `*MendelAdapter`.
 
 > [!IMPORTANT]
 > Fully quit and restart the Antigravity application after applying modifications for new context limit configurations and compaction watermarks to take effect.
+
+---
+
+### Workflow D: Subagent Context Window Stress Testing
+
+When verifying that a patched context ceiling (such as `1M (840K)` on `Gemini 4 Hydrogen`, `Argon`, `Carbon`, or `Orchestrator`) actually holds at runtime under an authenticated session without prematurely compacting at `256K`, execute [`scripts/stress_context.py`](scripts/stress_context.py) alongside a read-only `self` subagent:
+
+```bash
+# 1. Generate deterministic ~43.7KB (~16K tokens/file) read_file payloads in a scratch directory
+python3 scripts/stress_context.py --prepare --out-dir <scratch_dir>/stress_data --target 1m
+
+# 2. Launch a `self` subagent (Model: "inherit") with the printed read-only batch prompt:
+#    - Bulk phase: 8 files per step (keeps single-step growth ~130K, well under 160K reserve)
+#    - Precision tail: 1 file per step (~16K/step) to pinpoint the exact CHECKPOINT trigger ceiling
+
+# 3. Verify the subagent session's empirical peak context, CHECKPOINT steps, and PASS/FAIL verdict
+python3 scripts/stress_context.py --verify <subagent-conversation-id> --expected 1m
+
+# 4. (Optional) Audit combined parent + subagent token consumption and cost
+python3 scripts/analyze_tokens.py --session <parent-conversation-id>
+
+# 5. Clean up temporary batch_*.txt payload files
+python3 scripts/stress_context.py --cleanup --out-dir <scratch_dir>/stress_data
+```
+
+**Stress Test Rules**:
+* **Use Scratch Directory**: Always pass `--out-dir` inside the conversation artifact `scratch/` directory (never inside the user's code workspace) so stress payloads stay isolated and cleanable.
+* **Subagent Model Inheritance**: Invoke `self` with `Model="inherit"` while the active chat is set to the target model under test (e.g., `Gemini 4 Hydrogen`).
+* **Threshold Interpretation**: `CHECKPOINT` fires immediately after crossing `max_token_limit` (empirical triggers around `787K–840K` real API tokens on `1M` confirm `256K` / `512K` and Cloud Mendel overrides are bypassed).

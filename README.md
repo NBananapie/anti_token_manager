@@ -88,6 +88,7 @@ anti_token_manager/
 │   ├── report_daily_tokens.py     # 自动化每日/每周定时审计报告生成器
 │   ├── analyze_compact.py         # 上下文压缩行为与阈值动态分析
 │   ├── manage_token_limit.py      # 上下文窗口限制配置管理器
+│   ├── stress_context.py          # 子代理上下文窗口压测载荷生成与阈值校验
 │   ├── pricing.py                 # 模型价格表与计费引擎
 │   ├── gemini_pricing.json        # 本地价格配置缓存
 │   ├── transcript.py              # 高效流式与 SQLite 解析器
@@ -213,6 +214,21 @@ python scripts/manage_token_limit.py --set 1m --model orchestrator
 python scripts/manage_token_limit.py --restore
 ```
 > 注意：配置修改后，需完全退出并重启 Antigravity 应用程序以使新的上下文水印与限制生效。
+
+### 5.5 子代理上下文窗口压测校验 (`stress_context.py`)
+
+用于在重启 Antigravity 后实测验证目标模型（如 `Gemini 4 Hydrogen`）在真实登录会话下的上下文窗口上限是否已突破 `256K` 并按预期水位触发 `CHECKPOINT`：
+
+```bash
+# 1. 生成单文件 < 46KB 的确定性压测载荷（建议输出至临时或 scratch 目录）
+python scripts/stress_context.py --prepare --out-dir .stress_data --target 1m
+
+# 2. 启动子代理按提示分批（8 文件/步 + 尾部 1 文件/步精度探测）只读加载载荷后，核验实测阈值
+python scripts/stress_context.py --verify <subagent-conversation-id> --expected 1m
+
+# 3. 清理临时载荷文件
+python scripts/stress_context.py --cleanup --out-dir .stress_data
+```
 
 ---
 
