@@ -256,6 +256,15 @@ Copy-Item -Path "skills/antigravity-token-manager" -Destination "$HOME\.gemini\c
 
 ---
 
-## 8. 开源协议
+## 8. 免责声明（Disclaimer）
+
+1. 本项目仅供个人本地开发学习、性能统计与技术研究交流使用，与 Google 官方及 Google Antigravity 团队无任何隶属、合作或官方背书关系。
+2. 仓库中的 `analyze_tokens.py`、`report_daily_tokens.py`、`analyze_compact.py` 及 Web 监控服务均采用纯只读方式解析本地日志与数据库，不修改客户端状态，亦不会上传任何用户会话数据或密钥。
+3. `manage_token_limit.py` 涉及对本地 `language_server` 二进制文件的离线配置调整。客户端版本升级、系统环境差异或不当操作可能导致配置失效、程序启动异常或其他不可预知的问题。执行修改前请务必确认已生成备份文件，出现异常时可通过 `--restore` 参数或重新安装官方客户端恢复。
+4. 使用者应自行评估并承担使用本仓库代码与脚本所产生的一切风险及潜在后果（包括但不限于程序运行异常、本地数据损坏、服务条款合规风险或账号状态变动等），本项目作者及贡献者不对任何直接、间接、偶然或连带损失承担任何形式的法律或赔偿责任。
+
+---
+
+## 9. 开源协议
 
 本项目基于 [MIT License](LICENSE) 协议发布。
