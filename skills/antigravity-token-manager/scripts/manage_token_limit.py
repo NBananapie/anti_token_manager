@@ -3,7 +3,7 @@
 Antigravity Context Token Limit Manager CLI
 Configures max_token_limit thresholds (128K, 256K, 320K, 384K, 512K, 768K, 1M) for language_server.
 Supports updating all models simultaneously or targeting specific model groups
-(Flash, Argon, Carbon, Hydrogen, Orchestrator).
+(Flash, Argon, Carbon, Hydrogen, Neon, Orchestrator).
 Cross-platform compatible: macOS (ARM64) and Windows (x86_64).
 Zero-dependency using Python standard library.
 """
@@ -31,8 +31,8 @@ ARGON_PREFIX = rb'"CASCADE_USE_EXPERIMENT_CHECKPOINTER": "{\n    \"strategy\": \
 # - M124: Gemini 3.8 Flash (M317..M322 -> M124)
 # - M400: Claude Opus/Sonnet 5.5 base slot (M400..M405 -> M400)
 # - M408: Static Gemini 4 Argon / Carbon slots (M408..M431 -> M408)
-# Note: Cloud-pushed models not in snapshotmendelfp.models — including Gemini 4 Hydrogen
-# (Low/Medium/High/XHigh), Orchestrator (Carbon / Argon), and Gemini 4 Carbon (M427) —
+# Note: Cloud-pushed models not in snapshotmendelfp.models — including Gemini 4 Neon (M533),
+# Gemini 4 Hydrogen (Low/Medium/High/XHigh), Orchestrator (Carbon / Argon), and Gemini 4 Carbon (M427) —
 # bypass JSON slots and inherit the machine-code baseline in utils.GetCheckpointConfig (Pattern 1 & 2),
 # clamped safely at runtime by ClampCheckpointConfigForModelInfo to min(limit, MaxTokens - reserve).
 M124_FLASH38_PREFIX = (
@@ -553,6 +553,7 @@ def check_status(target_path: str, backup_path: str) -> bool:
             if overlay_bypassed
             else "Cloud Mendel Active [WARNING: Cloud MendelStateCache may override to 256K!]"
         )
+        print(f"  - Gemini 4 Neon (M533 / Low..XHigh):      {overlay_note}")
         print(f"  - Gemini 4 Hydrogen (Low/Med/High/XHigh): {overlay_note}")
         print(f"  - Orchestrator (Carbon / Argon):          {overlay_note}")
         print(f"  - Gemini 4 Carbon (New M427):             {overlay_note}")
@@ -604,7 +605,7 @@ def set_token_limit(
 ) -> None:
     """
     Set max_token_limit to 128k, 256k, 320k, 384k, 512k, 768k, 840k, or 1m (maps to 840K safe ceiling).
-    Can update all models simultaneously or target 'flash', 'argon', 'carbon', 'hydrogen', or 'orchestrator'.
+    Can update all models simultaneously or target 'flash', 'argon', 'carbon', 'hydrogen', 'neon', or 'orchestrator'.
     Protects shared machine-code baseline from accidental downward truncation when updating a single JSON profile.
     """
     _cleanup_stale_old_binaries(target_path)
@@ -613,7 +614,7 @@ def set_token_limit(
         print(f"Error: Unsupported limit '{limit}'. Choose from: 128k, 256k, 320k, 384k, 512k, 768k, 840k, 1m.")
         sys.exit(1)
 
-    valid_scopes = ("all", "flash", "argon", "carbon", "hydrogen", "orchestrator")
+    valid_scopes = ("all", "flash", "argon", "carbon", "hydrogen", "neon", "orchestrator")
     model_target = model.lower()
     if model_target not in valid_scopes:
         print(f"Error: Unsupported model scope '{model}'. Choose from: {', '.join(valid_scopes)}.")
@@ -677,7 +678,7 @@ def set_token_limit(
         )
 
     # 3. Determine safe Machine-Code Clamp & Dynamic Model Baseline (Pattern 1..4)
-    # Cloud-pushed models (Hydrogen, Orchestrator, Carbon M427) rely directly on Pattern 1.
+    # Cloud-pushed models (Neon, Hydrogen, Orchestrator, Carbon M427) rely directly on Pattern 1.
     # Also, Pattern 1 must never be lower than the highest active JSON slot, otherwise it would truncate that JSON slot.
     _, existing_clamp_vals, _, _ = inspect_binary_clamp(updated_data)
     cur_clamp_max = max(existing_clamp_vals) if existing_clamp_vals else 256000
@@ -687,7 +688,7 @@ def set_token_limit(
     )
     max_json_int = max(all_json_ints) if all_json_ints else 256000
 
-    if model_target in ("all", "carbon", "hydrogen", "orchestrator"):
+    if model_target in ("all", "carbon", "hydrogen", "neon", "orchestrator"):
         desired_clamp_int = max(target_int, max_json_int)
         if desired_clamp_int > target_int:
             summary_messages.append(
@@ -696,7 +697,7 @@ def set_token_limit(
                 f"use '--model all' to lower all models together."
             )
     else:
-        # 'flash' or 'argon' only: raise clamp if needed, but NEVER lower existing dynamic baseline (protects Hydrogen/Orchestrator/M427)
+        # 'flash' or 'argon' only: raise clamp if needed, but NEVER lower existing dynamic baseline (protects Neon/Hydrogen/Orchestrator/M427)
         desired_clamp_int = max(target_int, cur_clamp_max, max_json_int)
 
     int_to_key = {v: k for k, v in SUPPORTED_LIMITS_INT.items() if k != "840k"}
@@ -706,7 +707,7 @@ def set_token_limit(
     updated_data, c_clamp, c_arch = replace_binary_clamp(updated_data, clamp_key)
     if c_clamp > 0:
         summary_messages.append(
-            f"Dynamic Models & Binary Clamp ({c_arch} — Hydrogen / Orchestrator / Carbon M427): "
+            f"Dynamic Models & Binary Clamp ({c_arch} — Neon / Hydrogen / Orchestrator / Carbon M427): "
             f"patched {c_clamp} locations to {clamp_disp}"
         )
 
@@ -832,11 +833,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        choices=["all", "flash", "argon", "carbon", "hydrogen", "orchestrator"],
+        choices=["all", "flash", "argon", "carbon", "hydrogen", "neon", "orchestrator"],
         default="all",
         help=(
             "Model scope to apply the limit: 'all' (default, updates all static & dynamic models), "
-            "'flash' (Gemini 3.8 Flash M124), 'argon' (M408), or 'carbon'/'hydrogen'/'orchestrator'"
+            "'flash' (Gemini 3.8 Flash M124), 'argon' (M408), or 'carbon'/'hydrogen'/'neon'/'orchestrator'"
         ),
     )
     parser.add_argument(

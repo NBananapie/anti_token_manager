@@ -48,6 +48,12 @@ FALLBACK_GEMINI_PRICING: dict[str, dict[str, Any]] = {
         "cache_read": 0.075,
         "output": 7.50,
     },
+    "gemini-4-neon": {
+        "name": "Gemini 4 Neon (Medium)",
+        "input": 3.00,
+        "cache_read": 0.15,
+        "output": 15.00,
+    },
     "gemini-pro-orchestrator": {
         "name": "Orchestrator (Carbon)",
         "input": 2.00,
@@ -184,6 +190,14 @@ MODEL_ENUM_DISPLAY_MAP: dict[int, str] = {
     1429: "Gemini 4 Carbon (High)",
     1430: "Gemini 4 Carbon (Medium)",
     1431: "Gemini 4 Carbon (Low)",
+    1437: "Gemini 4 Carbon (Medium)",
+    1525: "Gemini 4 Hydrogen (High)",
+    1526: "Gemini 4 Hydrogen (Medium)",
+    1530: "Gemini 4 Hydrogen (High)",
+    1533: "Gemini 4 Neon (Medium)",
+    1535: "Gemini 4 Neon (XHigh)",
+    1667: "Orchestrator (Carbon)",
+    1669: "Gemini 3.8 Flash (Worker)",
 }
 
 # Backend gen_metadata raw model identifier -> standard display name
@@ -234,15 +248,24 @@ BACKEND_MODEL_DISPLAY_MAP: dict[str, str] = {
     "gemini-4-argon": "Gemini 4 Argon (High)",
     "gemini-4-hydrogen-xhigh": "Gemini 4 Hydrogen (XHigh)",
     "gemini-4-hydrogen-high": "Gemini 4 Hydrogen (High)",
+    "gemini-4-hydrogen-tiered-high": "Gemini 4 Hydrogen (High)",
     "gemini-4-hydrogen-medium": "Gemini 4 Hydrogen (Medium)",
     "gemini-4-hydrogen-low": "Gemini 4 Hydrogen (Low)",
     "gemini-4-hydrogen@default": "Gemini 4 Hydrogen (Medium)",
     "gemini-4-hydrogen": "Gemini 4 Hydrogen (Medium)",
+    "gemini-4-neon-xhigh": "Gemini 4 Neon (XHigh)",
+    "gemini-4-neon-high": "Gemini 4 Neon (High)",
+    "gemini-4-neon-tiered-high": "Gemini 4 Neon (High)",
+    "gemini-4-neon-medium": "Gemini 4 Neon (Medium)",
+    "gemini-4-neon-low": "Gemini 4 Neon (Low)",
+    "gemini-4-neon@default": "Gemini 4 Neon (Medium)",
+    "gemini-4-neon": "Gemini 4 Neon (Medium)",
     "gemini-pro-orchestrator": "Orchestrator (Carbon)",
     "gemini-pro-orchestrator-carbon": "Orchestrator (Carbon)",
     "gemini-pro-orchestrator-g1-ultra": "Orchestrator (Carbon)",
     "gemini-pro-orchestrator-argon": "Orchestrator (Argon)",
     "gemini-pro-orchestrator-g1-pro": "Orchestrator (Argon)",
+    "gemini-flash-worker-agy": "Gemini 3.8 Flash (Worker)",
     "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
     "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
     "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
@@ -333,7 +356,7 @@ def resolve_db_model_name(backend_model: str | None, model_enum: int | None) -> 
             return bm_disp
         # Dynamic / future Claude or Gemini model IDs in gen_metadata
         if is_claude_model(bm_low) or any(
-            k in bm_low for k in ("gemini", "argon", "carbon", "hydrogen", "orchestrator", "gpt-oss")
+            k in bm_low for k in ("gemini", "argon", "carbon", "hydrogen", "neon", "orchestrator", "gpt-oss")
         ):
             bm_disp = get_model_display_name(bm)
             if enum_disp and bm_disp.split(" (")[0] == enum_disp.split(" (")[0]:
@@ -372,6 +395,8 @@ def map_model_name_to_key(model_name: str | None) -> str:
         return "gemini-pro-orchestrator"
 
     # Google Gemini 4 & 3.x family
+    if "neon" in mn:
+        return "gemini-4-neon"
     if "hydrogen" in mn:
         return "gemini-4-hydrogen"
     if "carbon" in mn:
@@ -404,6 +429,14 @@ def get_model_display_name(model_name: str | None) -> str:
         if "argon" in low or "g1-pro" in low:
             return "Orchestrator (Argon)"
         return "Orchestrator (Carbon)"
+    if "neon" in low:
+        if "xhigh" in low:
+            return "Gemini 4 Neon (XHigh)"
+        if "high" in low:
+            return "Gemini 4 Neon (High)"
+        if "low" in low:
+            return "Gemini 4 Neon (Low)"
+        return "Gemini 4 Neon (Medium)"
     if "hydrogen" in low:
         if "xhigh" in low:
             return "Gemini 4 Hydrogen (XHigh)"

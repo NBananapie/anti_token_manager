@@ -29,6 +29,12 @@
     "cache_read": 0.075,
     "output": 7.5
   },
+  "gemini-4-neon": {
+    "name": "Gemini 4 Neon (Medium)",
+    "input": 3.0,
+    "cache_read": 0.15,
+    "output": 15.0
+  },
   "gemini-pro-orchestrator": {
     "name": "Orchestrator (Carbon)",
     "input": 2.0,
