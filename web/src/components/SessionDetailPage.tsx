@@ -1098,6 +1098,17 @@ export default function SessionDetailPage({
                           {cpAfter.reductionPct !== null && (
                             <span className="cp-chip-pct">{cpAfter.reductionPct.toFixed(1)}%</span>
                           )}
+                          {(cpAfter.costUsd ?? 0) > 0 && (
+                            <span className="mono" style={{ color: 'var(--cost)' }}>
+                              摘要消耗{' '}
+                              {formatCompactTokens(
+                                (cpAfter.inputTokens || 0) +
+                                  (cpAfter.cacheReadTokens || 0) +
+                                  (cpAfter.outputTokens || 0)
+                              )}{' '}
+                              · {formatUsd(cpAfter.costUsd)}
+                            </span>
+                          )}
                         </div>
                       )}
                     </React.Fragment>

@@ -284,10 +284,13 @@ def load_conversation_db_step_details(
             except Exception:
                 pass
 
-            # 2. Parse step_type = 15 (PLANNER_RESPONSE) rows in steps table
+            # 2. Parse step_type IN (15=PLANNER_RESPONSE, 23=CHECKPOINT) rows in steps table
             result: dict[int, dict[str, Any]] = {}
-            cur.execute("SELECT idx, metadata FROM steps WHERE step_type = 15 AND metadata IS NOT NULL;")
-            for idx, meta in cur.fetchall():
+            last_resolved_model: str | None = fallback_gen_model
+            cur.execute(
+                "SELECT idx, step_type, metadata FROM steps WHERE step_type IN (15, 23) AND metadata IS NOT NULL ORDER BY idx ASC;"
+            )
+            for idx, st_code, meta in cur.fetchall():
                 if not meta:
                     continue
                 inp, cache, out = 0, 0, 0
@@ -330,8 +333,10 @@ def load_conversation_db_step_details(
                 gen_enum = g["model_enum"] if g else None
                 eff_enum = step_enum if step_enum is not None else gen_enum
                 resolved_model = resolve_db_model_name(backend_m, eff_enum)
-                if resolved_model is None and backend_m is None and eff_enum is None:
-                    resolved_model = fallback_gen_model
+                if resolved_model is None:
+                    resolved_model = last_resolved_model or fallback_gen_model
+                elif st_code == 15:
+                    last_resolved_model = resolved_model
 
                 if thinking == 0 and response == 0 and g:
                     thinking = g["thinking_tokens"]
@@ -340,12 +345,17 @@ def load_conversation_db_step_details(
                 ttft_s = g["ttft_s"] if (g and g["ttft_s"] is not None) else None
                 stream_s = g["stream_s"] if (g and g["stream_s"] is not None) else None
 
-                if ttft_s is None and ts_created and ts_first and ts_first >= ts_created:
-                    ttft_s = ts_first - ts_created
-                if stream_s is None and ts_first and ts_done and ts_done >= ts_first:
-                    stream_s = ts_done - ts_first
+                if st_code == 15:
+                    if ttft_s is None and ts_created and ts_first and ts_first >= ts_created:
+                        ttft_s = ts_first - ts_created
+                    if stream_s is None and ts_first and ts_done and ts_done >= ts_first:
+                        stream_s = ts_done - ts_first
+
+                valid_ts = ts_created if (ts_created is not None and ts_created >= 1577836800.0) else None
 
                 result[idx] = {
+                    "step_type": st_code,
+                    "timestamp_s": valid_ts,
                     "input_tokens": inp,
                     "cache_read_tokens": cache,
                     "output_tokens": out,
@@ -496,23 +506,36 @@ class TranscriptScanner:
 
         for bdir in self.base_dirs:
             brain_dir = os.path.join(bdir, "brain")
-            if not os.path.exists(brain_dir):
-                continue
+            convs_dir = os.path.join(bdir, "conversations")
 
-            for entry in os.listdir(brain_dir):
-                conv_path = os.path.join(brain_dir, entry)
-                if not os.path.isdir(conv_path):
-                    continue
-                tf = os.path.join(conv_path, ".system_generated", "logs", "transcript.jsonl")
-                if not os.path.exists(tf):
+            candidate_ids: set[str] = set()
+            if os.path.exists(brain_dir):
+                for entry in os.listdir(brain_dir):
+                    if os.path.isdir(os.path.join(brain_dir, entry)):
+                        candidate_ids.add(entry)
+            if os.path.exists(convs_dir):
+                for fname in os.listdir(convs_dir):
+                    if fname.endswith(".db"):
+                        candidate_ids.add(fname[:-3])
+
+            for entry in sorted(candidate_ids):
+                tf = os.path.join(brain_dir, entry, ".system_generated", "logs", "transcript.jsonl")
+                db_file = os.path.join(convs_dir, f"{entry}.db")
+                has_tf = os.path.exists(tf)
+                has_db = os.path.exists(db_file)
+                if not has_tf and not has_db:
                     continue
 
                 if min_mtime is not None:
-                    try:
-                        if os.path.getmtime(tf) < min_mtime:
-                            continue
-                    except OSError:
-                        pass
+                    latest_mtime = 0.0
+                    for p in (tf, db_file):
+                        if os.path.exists(p):
+                            try:
+                                latest_mtime = max(latest_mtime, os.path.getmtime(p))
+                            except OSError:
+                                pass
+                    if latest_mtime > 0.0 and latest_mtime < min_mtime:
+                        continue
 
                 meta = self.conv_meta.get(
                     entry,
@@ -530,7 +553,7 @@ class TranscriptScanner:
                     },
                 )
 
-                # Load authoritative SQLite step models, token split & timing for this candidate conversation
+                # Load authoritative SQLite step models, token split, timestamps & checkpoints
                 db_step_details = self._get_db_step_details(entry)
 
                 # Determine initial fallback model if step 0 precedes any planner step
@@ -541,106 +564,192 @@ class TranscriptScanner:
                         break
 
                 conv_steps: list[dict[str, Any]] = []
+                seen_token_step_pos: dict[int, int] = {}
+                seen_all_indices: set[int] = set()
                 current_model = init_m
                 first_dt: datetime | None = None
                 last_dt: datetime | None = None
 
-                compact_events: list[dict[str, Any]] = []
-                cum_in = 0
-                cum_cache = 0
-                cum_out = 0
-                interval_steps = 0
-                last_planner_ctx = 0
+                if has_tf:
+                    with open(tf, "r", encoding="utf-8", errors="ignore") as fp:
+                        for line in fp:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                s = json.loads(line)
+                            except Exception:
+                                continue
 
-                with open(tf, "r", encoding="utf-8", errors="ignore") as fp:
-                    for line in fp:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            s = json.loads(line)
-                        except Exception:
-                            continue
+                            st_type = s.get("type", "UNKNOWN")
+                            content = s.get("content", "")
 
-                        st_type = s.get("type", "UNKNOWN")
-                        content = s.get("content", "")
+                            if st_type == "USER_INPUT":
+                                changed_m = extract_model_change(content)
+                                if changed_m:
+                                    current_model = changed_m
 
-                        if st_type == "USER_INPUT":
-                            changed_m = extract_model_change(content)
-                            if changed_m:
-                                current_model = changed_m
+                            dt = parse_datetime(s.get("created_at"))
+                            st_index = s.get("step_index", 0)
+                            inp = int(s.get("input_tokens", 0) or 0)
+                            cache = int(s.get("cache_read_tokens", 0) or 0)
+                            out = int(s.get("output_tokens", 0) or 0)
+                            has_tokens = "input_tokens" in s or "output_tokens" in s or "cache_read_tokens" in s
 
-                        dt = parse_datetime(s.get("created_at"))
-                        if dt:
-                            if first_dt is None or dt < first_dt:
-                                first_dt = dt
-                            if last_dt is None or dt > last_dt:
-                                last_dt = dt
+                            thinking_tok = 0
+                            response_tok = 0
+                            ttft_s: float | None = None
+                            stream_s: float | None = None
 
-                        st_index = s.get("step_index", 0)
-                        inp = int(s.get("input_tokens", 0) or 0)
-                        cache = int(s.get("cache_read_tokens", 0) or 0)
-                        out = int(s.get("output_tokens", 0) or 0)
-                        has_tokens = "input_tokens" in s or "output_tokens" in s or "cache_read_tokens" in s
+                            # Resolve authoritative model, tokens, thinking/response split & timing from SQLite DB
+                            if st_index in db_step_details:
+                                d = db_step_details[st_index]
+                                if d["model"]:
+                                    current_model = d["model"]
+                                if dt is None and d.get("timestamp_s") is not None:
+                                    dt = datetime.fromtimestamp(d["timestamp_s"], tz=DEFAULT_TZ)
+                                if (st_type == "PLANNER_RESPONSE" or st_type == "CHECKPOINT") and (
+                                    d["input_tokens"] or d["cache_read_tokens"] or d["output_tokens"]
+                                ):
+                                    if not has_tokens:
+                                        inp, cache, out = d["input_tokens"], d["cache_read_tokens"], d["output_tokens"]
+                                        has_tokens = True
+                                    thinking_tok = d["thinking_tokens"]
+                                    response_tok = d["response_tokens"]
+                                    ttft_s = d["ttft_s"]
+                                    stream_s = d["stream_s"]
 
-                        thinking_tok = 0
-                        response_tok = 0
-                        ttft_s: float | None = None
-                        stream_s: float | None = None
+                            if dt:
+                                if first_dt is None or dt < first_dt:
+                                    first_dt = dt
+                                if last_dt is None or dt > last_dt:
+                                    last_dt = dt
 
-                        # Resolve authoritative model, missing tokens, thinking/response split & timing from SQLite DB
-                        if st_index in db_step_details:
-                            d = db_step_details[st_index]
-                            if d["model"]:
-                                current_model = d["model"]
-                            if not has_tokens and st_type == "PLANNER_RESPONSE" and (
-                                d["input_tokens"] or d["cache_read_tokens"] or d["output_tokens"]
-                            ):
-                                inp, cache, out = d["input_tokens"], d["cache_read_tokens"], d["output_tokens"]
-                                has_tokens = True
-                            if st_type == "PLANNER_RESPONSE" or has_tokens:
-                                thinking_tok = d["thinking_tokens"]
-                                response_tok = d["response_tokens"]
-                                ttft_s = d["ttft_s"]
-                                stream_s = d["stream_s"]
+                            if has_tokens and out > 0 and thinking_tok == 0 and response_tok == 0:
+                                response_tok = out
 
-                        if has_tokens and out > 0 and thinking_tok == 0 and response_tok == 0:
-                            response_tok = out
+                            total_duration_s = (
+                                (ttft_s + stream_s)
+                                if (ttft_s is not None and stream_s is not None)
+                                else None
+                            )
+                            stream_tps = (
+                                (response_tok / stream_s)
+                                if (stream_s is not None and stream_s >= 0.5 and response_tok > 0)
+                                else None
+                            )
+                            e2e_tps = (
+                                (out / total_duration_s)
+                                if (total_duration_s is not None and total_duration_s > 0 and out > 0)
+                                else None
+                            )
 
-                        total_duration_s = (
-                            (ttft_s + stream_s)
-                            if (ttft_s is not None and stream_s is not None)
-                            else None
-                        )
-                        stream_tps = (
-                            (response_tok / stream_s)
-                            if (stream_s is not None and stream_s >= 0.5 and response_tok > 0)
-                            else None
-                        )
-                        e2e_tps = (
-                            (out / total_duration_s)
-                            if (total_duration_s is not None and total_duration_s > 0 and out > 0)
-                            else None
-                        )
+                            cin, cca, cout, ctot = (
+                                compute_step_cost(inp, cache, out, current_model)
+                                if has_tokens
+                                else (0.0, 0.0, 0.0, 0.0)
+                            )
 
-                        cin, cca, cout, ctot = (
-                            compute_step_cost(inp, cache, out, current_model)
-                            if has_tokens
-                            else (0.0, 0.0, 0.0, 0.0)
-                        )
+                            tool_calls = [
+                                tc.get("name", "unknown")
+                                for tc in (s.get("tool_calls", []) or [])
+                                if isinstance(tc, dict)
+                            ]
 
-                        tool_calls = [
-                            tc.get("name", "unknown")
-                            for tc in (s.get("tool_calls", []) or [])
-                            if isinstance(tc, dict)
-                        ]
+                            step_item = {
+                                "conv_id": entry,
+                                "step_index": st_index,
+                                "type": st_type,
+                                "dt": dt,
+                                "model": current_model,
+                                "input_tokens": inp,
+                                "cache_read_tokens": cache,
+                                "output_tokens": out,
+                                "thinking_tokens": thinking_tok,
+                                "response_tokens": response_tok,
+                                "ttft_s": ttft_s,
+                                "stream_s": stream_s,
+                                "total_duration_s": total_duration_s,
+                                "stream_tps": stream_tps,
+                                "e2e_tps": e2e_tps,
+                                "has_tokens": has_tokens,
+                                "cost_input": cin,
+                                "cost_cache": cca,
+                                "cost_output": cout,
+                                "cost_total": ctot,
+                                "tool_calls": tool_calls,
+                                "status": s.get("status", "DONE"),
+                            }
 
-                        step_item = {
+                            # Deduplicate retried PLANNER_RESPONSE lines sharing the same step_index in JSONL
+                            if has_tokens and st_type in ("PLANNER_RESPONSE", "CHECKPOINT") and st_index in seen_token_step_pos:
+                                conv_steps[seen_token_step_pos[st_index]] = step_item
+                            else:
+                                if has_tokens and st_type in ("PLANNER_RESPONSE", "CHECKPOINT"):
+                                    seen_token_step_pos[st_index] = len(conv_steps)
+                                conv_steps.append(step_item)
+                            seen_all_indices.add(st_index)
+
+                # Backfill any SQLite steps missing from truncated or absent transcript.jsonl
+                db_mtime_dt: datetime | None = None
+                if has_db:
+                    try:
+                        db_mtime_dt = datetime.fromtimestamp(os.path.getmtime(db_file), tz=DEFAULT_TZ)
+                    except OSError:
+                        pass
+
+                for st_index, d in sorted(db_step_details.items()):
+                    if st_index in seen_all_indices:
+                        continue
+                    st_code = d.get("step_type", 15)
+                    st_type = "CHECKPOINT" if st_code == 23 else "PLANNER_RESPONSE"
+                    inp = d["input_tokens"]
+                    cache = d["cache_read_tokens"]
+                    out = d["output_tokens"]
+                    has_tokens = bool(inp or cache or out)
+                    if st_code == 15 and not has_tokens:
+                        continue
+
+                    ts_s = d.get("timestamp_s")
+                    dt = datetime.fromtimestamp(ts_s, tz=DEFAULT_TZ) if ts_s is not None else db_mtime_dt
+                    if dt:
+                        if first_dt is None or dt < first_dt:
+                            first_dt = dt
+                        if last_dt is None or dt > last_dt:
+                            last_dt = dt
+
+                    step_model = d["model"] or current_model or init_m
+                    thinking_tok = d["thinking_tokens"]
+                    response_tok = d["response_tokens"]
+                    if has_tokens and out > 0 and thinking_tok == 0 and response_tok == 0:
+                        response_tok = out
+                    ttft_s = d["ttft_s"]
+                    stream_s = d["stream_s"]
+                    total_duration_s = (
+                        (ttft_s + stream_s) if (ttft_s is not None and stream_s is not None) else None
+                    )
+                    stream_tps = (
+                        (response_tok / stream_s)
+                        if (stream_s is not None and stream_s >= 0.5 and response_tok > 0)
+                        else None
+                    )
+                    e2e_tps = (
+                        (out / total_duration_s)
+                        if (total_duration_s is not None and total_duration_s > 0 and out > 0)
+                        else None
+                    )
+                    cin, cca, cout, ctot = (
+                        compute_step_cost(inp, cache, out, step_model)
+                        if has_tokens
+                        else (0.0, 0.0, 0.0, 0.0)
+                    )
+                    conv_steps.append(
+                        {
                             "conv_id": entry,
                             "step_index": st_index,
                             "type": st_type,
                             "dt": dt,
-                            "model": current_model,
+                            "model": step_model,
                             "input_tokens": inp,
                             "cache_read_tokens": cache,
                             "output_tokens": out,
@@ -656,33 +765,47 @@ class TranscriptScanner:
                             "cost_cache": cca,
                             "cost_output": cout,
                             "cost_total": ctot,
-                            "tool_calls": tool_calls,
-                            "status": s.get("status", "DONE"),
+                            "tool_calls": [],
+                            "status": "DONE",
                         }
-                        conv_steps.append(step_item)
+                    )
 
-                        interval_steps += 1
-                        cum_in += inp
-                        cum_cache += cache
-                        cum_out += out
+                if not conv_steps:
+                    continue
 
-                        if st_type == "PLANNER_RESPONSE" and has_tokens:
-                            last_planner_ctx = inp + cache
-                        elif st_type == "CHECKPOINT":
-                            compact_events.append(
-                                {
-                                    "step_index": st_index,
-                                    "dt": dt,
-                                    "model": current_model,
-                                    "steps_since_last": interval_steps,
-                                    "tokens_since_last": cum_in + cum_cache + cum_out,
-                                    "context_size_at_checkpoint": last_planner_ctx,
-                                }
-                            )
-                            cum_in = 0
-                            cum_cache = 0
-                            cum_out = 0
-                            interval_steps = 0
+                conv_steps.sort(key=lambda x: x["step_index"])
+
+                # Compute compaction events on the complete merged step timeline
+                compact_events: list[dict[str, Any]] = []
+                cum_in = 0
+                cum_cache = 0
+                cum_out = 0
+                interval_steps = 0
+                last_planner_ctx = 0
+
+                for step_item in conv_steps:
+                    interval_steps += 1
+                    cum_in += step_item["input_tokens"]
+                    cum_cache += step_item["cache_read_tokens"]
+                    cum_out += step_item["output_tokens"]
+
+                    if step_item["type"] == "PLANNER_RESPONSE" and step_item["has_tokens"]:
+                        last_planner_ctx = step_item["input_tokens"] + step_item["cache_read_tokens"]
+                    elif step_item["type"] == "CHECKPOINT":
+                        compact_events.append(
+                            {
+                                "step_index": step_item["step_index"],
+                                "dt": step_item["dt"],
+                                "model": step_item["model"],
+                                "steps_since_last": interval_steps,
+                                "tokens_since_last": cum_in + cum_cache + cum_out,
+                                "context_size_at_checkpoint": last_planner_ctx,
+                            }
+                        )
+                        cum_in = 0
+                        cum_cache = 0
+                        cum_out = 0
+                        interval_steps = 0
 
                 filtered_steps: list[dict[str, Any]] = []
                 for st in conv_steps:

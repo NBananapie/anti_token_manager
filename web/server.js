@@ -671,8 +671,19 @@ function getSessionModelStats(conversationId) {
 
   try {
     const stat = fs.statSync(dbFile);
+    const walFile = `${dbFile}-wal`;
+    let walSig = '0';
+    let effectiveMtimeMs = stat.mtimeMs;
+    if (fs.existsSync(walFile)) {
+      try {
+        const wStat = fs.statSync(walFile);
+        walSig = `${wStat.mtimeMs}:${wStat.size}`;
+        if (wStat.mtimeMs > effectiveMtimeMs) effectiveMtimeMs = wStat.mtimeMs;
+      } catch (e) {}
+    }
+    const cacheKey = `${stat.mtimeMs}:${stat.size}:${walSig}`;
     const cached = sessionCache.get(conversationId);
-    if (cached && cached.mtime === stat.mtimeMs) {
+    if (cached && cached.cacheKey === cacheKey) {
       return cached.data;
     }
 
@@ -701,6 +712,7 @@ function getSessionModelStats(conversationId) {
     }
 
     const generations = [];
+    const matchedStepIndices = new Set();
     const modelCounts = {};
     let totalInputTokens = 0;
     let totalCacheReadTokens = 0;
@@ -733,9 +745,10 @@ function getSessionModelStats(conversationId) {
       }
 
       const stepIndex = linkedStep ? linkedStep.stepIndex : (Number(parsed.metadataMap?.last_step_index) || r.idx);
+      if (linkedStep) matchedStepIndices.add(linkedStep.stepIndex);
       const effEnum = linkedStep?.stepEnum ?? parsed.modelEnum ?? null;
       const { model: resolvedModel, tier: modelTier } = resolveModelWithTier(parsed.model, effEnum);
-      const timestampMs = linkedStep?.timestampMs || Math.round(stat.mtimeMs);
+      const timestampMs = linkedStep?.timestampMs || Math.round(effectiveMtimeMs);
       if (firstTimestampMs === null || timestampMs < firstTimestampMs) firstTimestampMs = timestampMs;
       if (lastTimestampMs === null || timestampMs > lastTimestampMs) lastTimestampMs = timestampMs;
 
@@ -784,9 +797,85 @@ function getSessionModelStats(conversationId) {
       addTurnToSpeedAcc(sessionAcc, item);
     }
 
-    // Build compaction (CHECKPOINT) events with peak/reset context & reduction %
+    // Backfill any steps(15) that carry tokens in SQLite WAL/steps table but have no gen_metadata row yet
+    const lastKnownModel = generations.length > 0 ? generations[generations.length - 1].model : 'unknown';
+    for (const ps of parsedSteps) {
+      if (matchedStepIndices.has(ps.stepIndex)) continue;
+      const psTok = (ps.inputTokens || 0) + (ps.cacheReadTokens || 0) + (ps.outputTokens || 0);
+      if (psTok <= 0) continue;
+
+      const resolvedObj = ps.stepEnum != null ? resolveModelWithTier(null, ps.stepEnum) : { model: lastKnownModel, tier: null };
+      const psModel = resolvedObj.model !== 'unknown' ? resolvedObj.model : lastKnownModel;
+      const tsMs = ps.timestampMs || Math.round(effectiveMtimeMs);
+      if (firstTimestampMs === null || tsMs < firstTimestampMs) firstTimestampMs = tsMs;
+      if (lastTimestampMs === null || tsMs > lastTimestampMs) lastTimestampMs = tsMs;
+
+      const ctxTok = (ps.inputTokens || 0) + (ps.cacheReadTokens || 0);
+      if (ctxTok > peakContextTokens) peakContextTokens = ctxTok;
+      if (ctxTok > 0) currentContextTokens = ctxTok;
+
+      const thinkTok = ps.thinkingTokens || 0;
+      const respTok = (ps.responseTokens || 0) || (thinkTok === 0 ? ps.outputTokens : Math.max(0, ps.outputTokens - thinkTok));
+      const ttftSec = (ps.timestampMs && ps.tsFirstMs && ps.tsFirstMs >= ps.timestampMs)
+        ? Number(((ps.tsFirstMs - ps.timestampMs) / 1000).toFixed(3))
+        : null;
+      const streamSec = (ps.tsFirstMs && ps.tsDoneMs && ps.tsDoneMs >= ps.tsFirstMs)
+        ? Number(((ps.tsDoneMs - ps.tsFirstMs) / 1000).toFixed(3))
+        : null;
+      const totalSec = (ttftSec !== null && streamSec !== null) ? Number((ttftSec + streamSec).toFixed(3)) : null;
+      const streamTps = (streamSec !== null && streamSec >= 0.5 && respTok > 0)
+        ? Number((respTok / streamSec).toFixed(1))
+        : null;
+      const e2eTps = (totalSec !== null && totalSec > 0 && ps.outputTokens > 0)
+        ? Number((ps.outputTokens / totalSec).toFixed(1))
+        : null;
+      const { costUsd, cacheSavingsUsd: turnSavings } = computeTurnCostDetails(
+        psModel,
+        ps.inputTokens,
+        ps.cacheReadTokens,
+        ps.outputTokens
+      );
+
+      const item = {
+        idx: generations.length,
+        stepIndex: ps.stepIndex,
+        timestampMs: tsMs,
+        model: psModel,
+        modelTier: resolvedObj.tier,
+        modelEnum: ps.stepEnum,
+        inputTokens: ps.inputTokens,
+        cacheReadTokens: ps.cacheReadTokens,
+        contextTokens: ctxTok,
+        outputTokens: ps.outputTokens,
+        thinkingTokens: thinkTok,
+        responseTokens: respTok,
+        costUsd: Number(costUsd.toFixed(6)),
+        cacheSavingsUsd: Number(turnSavings.toFixed(6)),
+        ttftSec,
+        streamSec,
+        totalSec,
+        streamTps,
+        e2eTps,
+        metadata: {}
+      };
+      generations.push(item);
+      modelCounts[psModel] = (modelCounts[psModel] || 0) + 1;
+      totalInputTokens += ps.inputTokens;
+      totalCacheReadTokens += ps.cacheReadTokens;
+      totalOutputTokens += ps.outputTokens;
+      totalThinkingTokens += thinkTok;
+      totalResponseTokens += respTok;
+      estimatedCostUsd += costUsd;
+      cacheSavingsUsd += turnSavings;
+      addTurnToSpeedAcc(sessionAcc, item);
+    }
+    generations.sort((a, b) => a.stepIndex - b.stepIndex || a.idx - b.idx);
+
+    // Build compaction (CHECKPOINT) events with peak/reset context, reduction %, and actual summary LLM cost
     const sortedGensByStep = [...generations].sort((a, b) => a.stepIndex - b.stepIndex || a.idx - b.idx);
     const checkpoints = [];
+    let billedCheckpointCount = 0;
+
     for (let cIdx = 0; cIdx < rawCheckpoints.length; cIdx++) {
       const cp = rawCheckpoints[cIdx];
       const cpMeta = cp.metadata ? parseStepMetadataBlob(Buffer.from(cp.metadata)) : null;
@@ -810,6 +899,38 @@ function getSessionModelStats(conversationId) {
         : null;
       const tsMs = cpMeta?.timestampMs || beforeTurn?.timestampMs || afterTurn?.timestampMs || Math.round(stat.mtimeMs);
 
+      const cpIn = cpMeta?.inputTokens || 0;
+      const cpCache = cpMeta?.cacheReadTokens || 0;
+      const cpOut = cpMeta?.outputTokens || 0;
+      const cpThink = cpMeta?.thinkingTokens || 0;
+      const cpResp = (cpMeta?.responseTokens || 0) || (cpThink === 0 ? cpOut : Math.max(0, cpOut - cpThink));
+      const cpHasTokens = (cpIn + cpCache + cpOut) > 0;
+
+      // Resolve model used by CHECKPOINT summarization (explicit stepEnum or fallback to pre-compaction turn model)
+      const cpResolved = cpMeta?.stepEnum != null
+        ? resolveModelWithTier(null, cpMeta.stepEnum).model
+        : (beforeTurn?.model || afterTurn?.model || 'unknown');
+      const cpModel = cpResolved !== 'unknown' ? cpResolved : (beforeTurn?.model || 'unknown');
+
+      let cpCostUsd = 0;
+      let cpSavingsUsd = 0;
+      if (cpHasTokens) {
+        const cDet = computeTurnCostDetails(cpModel, cpIn, cpCache, cpOut);
+        cpCostUsd = cDet.costUsd;
+        cpSavingsUsd = cDet.cacheSavingsUsd;
+        billedCheckpointCount += 1;
+        totalInputTokens += cpIn;
+        totalCacheReadTokens += cpCache;
+        totalOutputTokens += cpOut;
+        totalThinkingTokens += cpThink;
+        totalResponseTokens += cpResp;
+        estimatedCostUsd += cpCostUsd;
+        cacheSavingsUsd += cpSavingsUsd;
+        modelCounts[cpModel] = (modelCounts[cpModel] || 0) + 1;
+        if (firstTimestampMs === null || tsMs < firstTimestampMs) firstTimestampMs = tsMs;
+        if (lastTimestampMs === null || tsMs > lastTimestampMs) lastTimestampMs = tsMs;
+      }
+
       checkpoints.push({
         index: cIdx + 1,
         stepIndex: cpStep,
@@ -818,7 +939,15 @@ function getSessionModelStats(conversationId) {
         afterStepIndex: afterTurn ? afterTurn.stepIndex : null,
         peakContext,
         resetContext,
-        reductionPct
+        reductionPct,
+        model: cpModel,
+        inputTokens: cpIn,
+        cacheReadTokens: cpCache,
+        outputTokens: cpOut,
+        thinkingTokens: cpThink,
+        responseTokens: cpResp,
+        costUsd: Number(cpCostUsd.toFixed(6)),
+        cacheSavingsUsd: Number(cpSavingsUsd.toFixed(6))
       });
     }
 
@@ -828,7 +957,7 @@ function getSessionModelStats(conversationId) {
     const result = {
       conversationId,
       mtimeMs: Math.round(stat.mtimeMs),
-      totalCalls: generations.length,
+      totalCalls: generations.length + billedCheckpointCount,
       latestModel,
       modelCounts,
       totalInputTokens,
@@ -852,7 +981,8 @@ function getSessionModelStats(conversationId) {
     };
 
     sessionCache.set(conversationId, {
-      mtime: stat.mtimeMs,
+      cacheKey,
+      mtime: effectiveMtimeMs,
       data: result
     });
 
@@ -1077,8 +1207,37 @@ function getMasterIndex() {
       for (const cp of sDetail.checkpoints) {
         if (cp.timestampMs) {
           const dKey = toLocalDateKey(cp.timestampMs);
-          const b = dailyMap.get(dKey);
-          if (b) b.compactions += 1;
+          let b = dailyMap.get(dKey);
+          if (!b) {
+            b = {
+              date: dKey,
+              tokens: 0,
+              inputTokens: 0,
+              cacheReadTokens: 0,
+              outputTokens: 0,
+              costUsd: 0,
+              calls: 0,
+              sessions: 0,
+              compactions: 0
+            };
+            dailyMap.set(dKey, b);
+          }
+          b.compactions += 1;
+          const cpTok = (cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0);
+          if (cpTok > 0) {
+            b.tokens += cpTok;
+            b.inputTokens += cp.inputTokens || 0;
+            b.cacheReadTokens += cp.cacheReadTokens || 0;
+            b.outputTokens += cp.outputTokens || 0;
+            b.costUsd += cp.costUsd || 0;
+            b.calls += 1;
+            const dObj = new Date(cp.timestampMs);
+            const dow = (dObj.getDay() + 6) % 7;
+            const hr = dObj.getHours();
+            hourlyMatrix[dow][hr].tokens += cpTok;
+            hourlyMatrix[dow][hr].costUsd += cp.costUsd || 0;
+            hourlyMatrix[dow][hr].calls += 1;
+          }
         }
       }
     }
@@ -1205,11 +1364,15 @@ function computeWindowStats(rangeStr, exactDateStr) {
       ? d.generations
       : d.generations.filter(g => inBounds(g.timestampMs));
 
-    if (filteredTurns.length === 0) continue;
-
     const filteredCps = (bounds.startMs === null && bounds.endMs === null)
       ? d.checkpoints
       : d.checkpoints.filter(cp => inBounds(cp.timestampMs));
+
+    const billedFilteredCps = filteredCps.filter(
+      cp => ((cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0)) > 0
+    );
+
+    if (filteredTurns.length === 0 && billedFilteredCps.length === 0) continue;
 
     const sessModelCounts = {};
     const sessSpeedAcc = createSpeedAcc();
@@ -1242,11 +1405,35 @@ function computeWindowStats(rangeStr, exactDateStr) {
       addTurnToSpeedAcc(modelSpeedAccMap[g.model], g);
     }
 
+    // Include CHECKPOINT summarization LLM token usage & cost to align 100% with CLI audit ground truth
+    for (const cp of billedFilteredCps) {
+      if (cp.timestampMs) {
+        if (windowMinTs === null || cp.timestampMs < windowMinTs) windowMinTs = cp.timestampMs;
+        if (windowMaxTs === null || cp.timestampMs > windowMaxTs) windowMaxTs = cp.timestampMs;
+        if (cp.timestampMs > sLastTs) sLastTs = cp.timestampMs;
+      }
+      const cpTok = (cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0);
+      const cpModel = cp.model || d.latestModel || 'unknown';
+      sIn += cp.inputTokens || 0;
+      sCache += cp.cacheReadTokens || 0;
+      sOut += cp.outputTokens || 0;
+      sThink += cp.thinkingTokens || 0;
+      sResp += cp.responseTokens || 0;
+      sCost += cp.costUsd || 0;
+      sSave += cp.cacheSavingsUsd || 0;
+
+      sessModelCounts[cpModel] = (sessModelCounts[cpModel] || 0) + 1;
+      modelTotals[cpModel] = (modelTotals[cpModel] || 0) + 1;
+      modelCosts[cpModel] = (modelCosts[cpModel] || 0) + (cp.costUsd || 0);
+      modelTokens[cpModel] = (modelTokens[cpModel] || 0) + cpTok;
+    }
+
     for (const m of Object.keys(sessModelCounts)) {
       modelSessionCount[m] = (modelSessionCount[m] || 0) + 1;
     }
 
-    totalCalls += filteredTurns.length;
+    const billedCalls = filteredTurns.length + billedFilteredCps.length;
+    totalCalls += billedCalls;
     totalInputTokens += sIn;
     totalCacheReadTokens += sCache;
     totalOutputTokens += sOut;
@@ -1266,9 +1453,9 @@ function computeWindowStats(rangeStr, exactDateStr) {
       parentId: rec.resolved.parentId,
       childCount: childIds.length,
       preview: rec.summary?.preview || '',
-      step_count: rec.summary?.step_count || filteredTurns.length,
+      step_count: rec.summary?.step_count || billedCalls,
       last_modified_time: sLastTs ? new Date(sLastTs).toISOString() : rec.lastModifiedIso,
-      calls: filteredTurns.length,
+      calls: billedCalls,
       latestModel: d.latestModel,
       modelsUsed: Object.keys(sessModelCounts),
       modelCounts: sessModelCounts,

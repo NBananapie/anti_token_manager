@@ -127,6 +127,11 @@ export interface CheckpointEvent {
   peakContext: number;
   resetContext: number | null;
   reductionPct: number | null;
+  model?: string;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
 }
 
 export interface ChildSessionSummary {
