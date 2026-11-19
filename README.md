@@ -1,114 +1,109 @@
-# Antigravity Token Manager & Model Monitor (anti_token_manager)
+# Antigravity Token Manager & Telemetry Monitor
 
-针对 Google Antigravity 本地开发环境的 Token 消耗审计、成本核算、输出速率监测及物理模型路由大盘工具套件。
+[![Python](https://img.shields.io/badge/Python-3.10%2B%20Stdlib-3776AB?style=flat-square)](https://www.python.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-22.5%2B%20node%3Asqlite-339933?style=flat-square)](https://nodejs.org/)
+[![React](https://img.shields.io/badge/React-19%20%2B%20Vite%208-2563EB?style=flat-square)](https://react.dev/)
+[![License](https://img.shields.io/badge/License-MIT-0F172A?style=flat-square)](LICENSE)
 
-项目集成基于 Python 标准库实现的命令行审计工具、定时报告器、上下文限制管理模块，以及基于 React 19 与 Node.js 原生开发的高性能 Astryx 风格实时监测 Web 控制台。
+面向 Google Antigravity 本地开发环境的 **Token 消耗审计、实时上下文水位监控、全模型与思考档位遥测、上下文压缩波形分析及窗口上限运维套件**。
+
+项目全部后端解析均采用纯只读方式直接解码 Antigravity 本地 SQLite（`steps` / `gen_metadata` / `conversation_summaries.db`），Python 命令行工具链零第三方依赖，Web 端基于原生 `node:sqlite` + SSE 与 React 19 构建，即开即用。
+
+<p align="center">
+  <img src="docs/assets/demo-preview.gif" alt="Antigravity Monitor 实时遥测与上下文波形演示" width="100%" />
+</p>
+
+<p align="center">
+  <a href="docs/assets/demo.mp4"><strong>观看完整高清演示视频 (MP4, 1280×800)</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#2-界面预览"><strong>查看高清界面截图</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#4-快速开始"><strong>30 秒快速上手</strong></a>
+  &nbsp;·&nbsp;
+  <a href="#5-python-命令行审计与运维套件"><strong>CLI 审计与上限管理</strong></a>
+</p>
 
 ---
 
-## 1. 架构拓扑
+## 1. 核心能力
+
+### 1.1 实时上下文监控与真实上限探测
+- **零侵入只读探测 `language_server` 实际生效上限**：自动识别本机 `language_server` 二进制的 Pattern 1/3/4 配置与 Cloud Mendel 覆盖状态，实时显示当前真实阈值（如 `1M (840K)` 或默认 `256K`）。
+- **活跃会话水位驾驶舱**：自动锁定最新活跃主会话，通过定制化下拉选择器（原生 `appearance: base-select`）快速切换最近活跃会话；通过 SSE 实时更新**当前已用上下文、距离下次压缩剩余安全空间、缓存读取 vs 本步新增双段进度条、当前端点与思考档位及已触发压缩次数**。
+
+### 1.2 全模型物理端点与思考档位精准归因
+- 同步解码 `gen_metadata`（Protobuf 字段 19 物理端点标识）与 `steps`（`model_enum` 枚举 ID），还原全系列模型及精确思考档位：
+  - **Google Gemini 4 系列**：`gemini-4-neon (XHigh / Medium)`、`gemini-4-hydrogen (High / Medium)`、`gemini-4-hydrogen-tiered (High)`、`gemini-4-carbon (High / Medium)`、`gemini-4-argon (High)`、`gemini-pro-orchestrator (Carbon / Argon)`
+  - **Google Gemini 3.x 与 Worker 系列**：`gemini-3.8-flash (High / Medium)`、`gemini-3.8-flash-tiered (High)`、`gemini-flash-worker-agy (Worker)`、`gemini-3.5-flash-lite`、`gemini-3.1-pro`
+  - **Anthropic Claude 系列**：`claude-opus-5-5 (Max / High / Medium / Low)`、`claude-sonnet-5-5`、`claude-opus-4-6 (Thinking)`、`claude-sonnet-4-6`、`claude-haiku-4-5`
+- 支持在模型排行榜中按**调用量 / 最近活跃 / 吐字速率 / 低延迟**四维排序，直接横向对比同模型不同思考档位的流式输出速度（`tok/s`）与首字等待时间（`TTFT`）。
+
+### 1.3 全局步级时间切片与 Token 消耗热力图
+- **精确步级时间范围**：顶栏支持一键切换 **`今日` / `近 7 天`（默认）/ `近 30 天` / `全部`**，按每步真实发生时间戳聚合统计，明确标出起止日期。
+- **双视图消耗热力图**：
+  - **按天日历热力图**：严格 1:1 正方形 34 周翡翠色阶点阵，支持切换 `Token / 费用 / 调用` 指标，悬停查看单日明细，**点击任意日期联动过滤下方会话明细表**；
+  - **`7×24h` 时段热力矩阵**：按星期 × 24 小时呈现全历史活跃分布，直观识别个人开发高频消耗时段。
+
+### 1.4 独立全幅会话深度分析（锯齿上下文波形 + 压缩轨迹）
+- 点击任意会话进入独立的宽幅详情视图（支持 `#/session/<id>` 路由、浏览器前进后退与 `Esc` 秒回原滚动位置）：
+  - **双色锯齿上下文演变图**：堆叠呈现每步的普通输入（`input_tokens`）与缓存复用（`cache_read_tokens`），绘制上限参考虚线、`CHECKPOINT` 红色触发锚点、绿色基线重置点与顶部派生子智能体活跃泳道。
+  - **零遮挡交互体验**：鼠标滑过波形即触发十字准星与顶部实时精确读数条；画布下方横向排列压缩快照胶囊（峰值、重置值、压缩缩减率），点击即可高亮波峰并定位至对应轮次与内联压缩分割横幅。
+  - **耗时与速率双视图 + 主子合并账单**：一键切换至逐轮 `TTFT / Stream` 耗时堆叠图；自动关联 `parent_conversation_id` 汇总主会话与所有派生子智能体的合并 Token 与费用。
+
+### 1.5 双厂商费用与缓存节省核算 + 一键隐私脱敏
+- 内置与 [gemini_pricing.json](scripts/gemini_pricing.json) 同源的双厂商费率引擎，精确计算实际估算费用及**对比无缓存节省的金额与比例**（如省 `82%`）。
+- **一键隐私脱敏模式**：顶栏提供隐私模式开关（亦支持 `?privacy=1` 直达），开启后保留 100% 真实统计、热力图、档位与锯齿波形，同时对所有会话标题、下拉选项、子任务名称与长 ID 执行确定性不可逆脱敏，方便分享截图与录屏。
+- **自适应明暗双模**：遵循系统浅色 / 深色偏好并提供顶栏两态即时切换，零白屏闪烁（FOUC），适配暗色滚动条与 WCAG AA 对比度。
+
+---
+
+## 2. 界面预览
+
+### 深色模式总览大盘（KPI + 实时上下文监控 + 34 周热力图 + 模型分档排行）
+![深色模式总览大盘](docs/assets/overview-dark.png)
+
+### 浅色模式总览与定制活跃会话选择器
+![浅色模式总览与定制下拉选择器](docs/assets/overview-light.png)
+
+### 独立会话详情页（双色锯齿上下文演变 + CHECKPOINT 压缩锚点与胶囊跳转）
+![独立会话上下文波形详情页](docs/assets/session-detail.png)
+
+---
+
+## 3. 系统架构拓扑
 
 ```mermaid
 flowchart TD
-    subgraph AntigravityStorage["Antigravity 本地存储层 (只读访问)"]
-        DB1["conversation_summaries.db<br/>(会话元数据/步数/总Token)"]
-        DB2["conversations/*.db<br/>(单会话 steps / gen_metadata 原始负载)"]
-        LOG1["transcript.jsonl<br/>(实时流式事件日志)"]
-        BIN1["language_server.exe<br/>(核心语言服务二进制文件)"]
+    subgraph Storage["Antigravity 本地数据层 (只读访问)"]
+        DB1["conversation_summaries.db<br/>(会话元数据 / 主子层级关系)"]
+        DB2["conversations/*.db<br/>(steps 15/23 轨迹与压缩 / gen_metadata 负载)"]
+        LOG1["brain/*/transcript.jsonl<br/>(流式事件日志)"]
+        BIN1["language_server.exe<br/>(核心语言服务二进制)"]
     end
 
-    subgraph PythonSuite["Python 审计与上下文运维套件 (scripts/)"]
-        P_AUDIT["analyze_tokens.py<br/>(周期统计 / 计费核算 / 速率分析)"]
-        P_DAILY["report_daily_tokens.py<br/>(昨日/周报定时报告生成器)"]
-        P_COMPACT["analyze_compact.py<br/>(上下文压缩阈值与缩减分析)"]
-        P_LIMIT["manage_token_limit.py<br/>(128K~1M/840K 窗口二进制配置)"]
-        P_TRANS["transcript.py & pricing.py<br/>(单遍流式解析器 / Gemini & Claude 价格引擎)"]
+    subgraph WebApp["Web 实时遥测大盘 (web/)"]
+        SRV["server.js (Node.js 原生服务)<br/>• node:sqlite 并发只读解码 steps & gen_metadata<br/>• language_server 上限只读探测<br/>• 步级时间切片 / 热力图聚合 / 费率引擎<br/>• SSE 实时推送 (/api/events)"]
+        UI["React 19 + Vite 8 前端<br/>• 实时上下文监控 (base-select)<br/>• 1:1 日历热力图 & 7x24h 矩阵<br/>• 独立详情页 (锯齿波形 / 压缩胶囊 / 主子合并)<br/>• 明暗双模 & 一键隐私脱敏"]
     end
 
-    subgraph WebMonitor["Web 实时监控大盘 (web/)"]
-        SRV["server.js (Node.js 原生服务)<br/>• 原生 node:sqlite 只读连接<br/>• Protobuf gen_metadata 解码器<br/>• Server-Sent Events (SSE) 广播<br/>• REST API 路由 (/api/*)"]
-        UI["React 19 + Vite 前端<br/>• Astryx 风格界面设计<br/>• 响应式容器查询表格<br/>• 实时速率与首字延迟看板<br/>• 逐轮会话时序与端点钻取"]
+    subgraph CliSuite["Python 命令行审计与运维套件 (scripts/)"]
+        P1["analyze_tokens.py / report_daily_tokens.py<br/>(多周期统计 / 成本与缓存核算 / 日周报)"]
+        P2["analyze_compact.py<br/>(压缩水位与缩减率统计 / 单会话轨迹)"]
+        P3["manage_token_limit.py & stress_context.py<br/>(128K~1M/840K 上限管理 / 子代理压测)"]
+        P4["transcript.py & pricing.py<br/>(流式解析器 / 模型枚举与双厂商费率)"]
     end
 
     DB1 -->|"只读查询"| SRV
     DB2 -->|"Protobuf 解码"| SRV
-    LOG1 -->|"文件监听与推送"| SRV
-    SRV -->|"SSE / JSON REST"| UI
+    BIN1 -.->|"mtime 缓存只读探测"| SRV
+    SRV -->|"REST / SSE"| UI
 
-    DB1 -->|"只读统计"| P_TRANS
-    DB2 -->|"指标提取"| P_TRANS
-    LOG1 -->|"单遍扫描"| P_TRANS
-    P_TRANS --> P_AUDIT
-    P_TRANS --> P_DAILY
-    P_TRANS --> P_COMPACT
-    BIN1 <-->|"十六进制模式匹配与配置"| P_LIMIT
-```
-
----
-
-## 2. 核心特性
-
-### 2.1 零侵入底层端点探测
-- 采用 Node.js 原生 `node:sqlite` 并发只读模式读取本地数据库，完全兼容 WAL 机制，不产生文件锁，不干扰 Antigravity 正常对话执行。
-- 逐轮流式解码 `gen_metadata` 中的 Protobuf 原始二进制负载，提取字段 19 携带的真实物理模型端点标识（例如 `gemini-3.8-flash`、`gemini-4-hydrogen`、`gemini-4-carbon`、`gemini-4-argon`、`gemini-pro-orchestrator`、`claude-opus-5-5-high` 等）。
-
-### 2.2 速率与性能多维指标审计
-- **流式输出速率 (Stream TPS)**：统计首字到达至输出完成期间的吐字速率（`responseTokens / streamSec`），排除网络预填充与思考推理耗时。
-- **端到端速率 (E2E TPS)**：基于完整交互步耗时计算的全局速率（`outputTokens / totalSec`）。
-- **首字响应延迟 (Avg TTFT)**：精准衡量输入上下文预填充、网络传输与模型深度思考的等待时长。
-- **思维链分离核算**：清晰分离思考推理 Token（`thinkingTokens`）与正文可见 Token（`responseTokens`），展示模型推理占比。
-
-### 2.3 双厂商全模型计费核算
-- 内置 Google Gemini（Carbon / Argon / Hydrogen / Orchestrator / Flash / Pro / Lite 系列）与 Anthropic Claude（Opus / Sonnet / Haiku 系列）官方价格模型与阶梯计费逻辑。
-- 支持 `Orchestrator (Carbon / Argon)` 编排会话按单步真实物理路由模型（如 `Carbon` 规划步与 `Hydrogen` 执行步）自动拆分计费，支持基于本地价格缓存文件 `gemini_pricing.json` 与在线实时同步。
-
-### 2.4 主子会话递归穿透归集
-- 针对 Antigravity 派生的各类子代理（Subagents，如 `research`、`codebase-retriever`、`terminal` 等），自动化工具与 Web 大盘均支持通过 `parent_conversation_id` 进行递归穿透关联，避免遗漏后台子任务的资源消耗。
-
-### 2.5 上下文窗口限制配置与压缩审计
-- 支持针对 `language_server` 进行上下文窗口上限配置（`128K`、`256K`、`320K`、`384K`、`512K`、`768K`、`1M`），并提供一键还原默认配置机制。
-- 深入底层 x86_64 机器码与 `.rdata` JSON 插槽，解除 Cloud MendelStateCache 云端覆盖与 5 处机器码截断钳制（Clamp），适配 1M 窗口下 Google 官方 `claude-1m_840k` 标准（840K 安全上限，保留 160K 空间用于工具输出扩展与检查点生成）。
-- 支持跨平台原子写入机制，在 Windows 上即使 `language_server` 处于运行状态，亦可通过原子重命名无损完成二进制热配置。
-- 自动捕捉模型在达到上下文水印时的截断压缩行为（`CHECKPOINT`），分析交互轮次、触发上下文量以及压缩缩减百分比，支持 `--session` 逐步上下文轨迹分析。
-
----
-
-## 3. 项目目录结构
-
-```
-anti_token_manager/
-├── README.md                      # 项目技术文档与使用指南
-├── LICENSE                        # MIT 开源许可证
-├── .gitignore                     # Git 忽略配置
-├── requirements.txt               # Python 运行环境说明
-├── package.json                   # 根目录 NPM 任务入口
-├── start.bat                      # Windows 一键启动脚本
-├── scripts/                       # Python 核心审计工具套件
-│   ├── analyze_tokens.py          # 多周期/单会话 Token 消耗与成本审计
-│   ├── report_daily_tokens.py     # 自动化每日/每周定时审计报告生成器
-│   ├── analyze_compact.py         # 上下文压缩行为与阈值动态分析
-│   ├── manage_token_limit.py      # 上下文窗口限制配置管理器
-│   ├── stress_context.py          # 子代理上下文窗口压测载荷生成与阈值校验
-│   ├── pricing.py                 # 模型价格表与计费引擎
-│   ├── gemini_pricing.json        # 本地价格配置缓存
-│   ├── transcript.py              # 高效流式与 SQLite 解析器
-│   └── formatter.py               # 控制台格式化与中英双宽对齐
-├── web/                           # Web 实时监测大盘
-│   ├── package.json               # Web 端依赖声明与脚本
-│   ├── vite.config.ts             # Vite 构建与反向代理配置
-│   ├── tsconfig.json              # TypeScript 编译配置
-│   ├── index.html                 # 页面 HTML 入口
-│   ├── server.js                  # 原生 Node.js 服务 (SSE + SQLite 只读)
-│   ├── start.bat                  # Web 服务独立启动脚本
-│   ├── dist/                      # 预编译生产静态产物 (即开即用)
-│   └── src/
-│       ├── App.tsx                # 监控大盘主界面组件
-│       ├── main.tsx               # React 根入口
-│       └── index.css              # 全局样式与容器查询
-└── skills/
-    └── antigravity-token-manager/ # 可直接载入 Antigravity 的技能配置包
-        ├── SKILL.md               # 技能定义与提示词规范
-        └── scripts/               # 技能内嵌完整执行脚本
+    DB1 --> P4
+    DB2 --> P4
+    LOG1 --> P4
+    P4 --> P1
+    P4 --> P2
+    BIN1 <-->|"离线配置与还原"| P3
 ```
 
 ---
@@ -116,39 +111,46 @@ anti_token_manager/
 ## 4. 快速开始
 
 ### 4.1 环境准备
-- **Python**：3.10 或更高版本（纯标准库实现，无需 `pip install` 额外依赖）。
-- **Node.js**：18.0.0 或更高版本（用于运行 Web 监控服务 `node:sqlite` 原生模块）。
+- **Node.js**：`22.5.0` 或更高版本（内置原生 `node:sqlite`，无需额外安装原生编译依赖）。
+- **Python**：`3.10` 或更高版本（CLI 套件纯标准库实现，无需 `pip install`）。
 
-### 4.2 启动 Web 实时监测大盘
+### 4.2 启动 Web 实时遥测大盘
 
-#### 方式 1：双击批处理脚本（推荐）
-在 Windows 资源管理器中直接双击根目录下的 `start.bat`。脚本将自动打开默认浏览器访问控制台，并启动后台服务：
-```
+**方式一：Windows 一键启动**
+双击根目录下的 [start.bat](start.bat)，自动拉起本地服务并在浏览器打开：
+```text
 http://127.0.0.1:3820
 ```
 
-#### 方式 2：命令行启动
+**方式二：命令行启动（生产静态产物已预构建，开箱即用）**
 ```bash
-# 启动内置服务（已预装生产静态产物，无需额外编译）
+# 直接通过 npm 启动
 npm start
 
 # 或直接使用 Node 启动
 node web/server.js
+
+# 自定义端口与 Antigravity 数据目录
+PORT=8080 ANTIGRAVITY_DATA_DIR="C:/Users/YourName/.gemini/antigravity" node web/server.js
 ```
 
-服务默认监听 `3820` 端口。如需更改端口或自定义 Antigravity 数据目录，可传入环境变量：
+> 提示：访问 `http://127.0.0.1:3820/?privacy=1` 可直接以**隐私脱敏模式**打开，适合录屏或截图分享。
+
+### 4.3 二次开发与前端构建
 ```bash
-PORT=8080 ANTIGRAVITY_DATA_DIR="C:/Users/YourName/.gemini/antigravity" node web/server.js
+cd web
+npm install
+npm run dev    # 本地热更新开发
+npm run build  # 重新生成 web/dist 生产产物
 ```
 
 ---
 
-## 5. Python 命令行审计工具使用
+## 5. Python 命令行审计与运维套件
 
-### 5.1 会话 Token 审计与成本核算 (`analyze_tokens.py`)
-
+### 5.1 多周期 / 单会话 Token 与成本审计 (`analyze_tokens.py`)
 ```bash
-# 查看今日全模型 Token 消耗、速率及费用总览
+# 查看今日全模型（含档位）Token 消耗、速率与估算费用
 python scripts/analyze_tokens.py --period today
 
 # 按天分组查看本周消耗
@@ -157,76 +159,63 @@ python scripts/analyze_tokens.py --period this-week --group-by date
 # 按周分组查看本月消耗
 python scripts/analyze_tokens.py --period this-month --group-by week
 
-# 审计特定会话（自动穿透关联其所有子代理 Subagents）
-python scripts/analyze_tokens.py --session 6d9813c0
+# 审计特定会话（自动递归穿透归集所有派生子智能体）
+python scripts/analyze_tokens.py --session <conversation-id-prefix>
 
-# 自定义日期区间并导出为 JSON 格式
-python scripts/analyze_tokens.py --start 2026-11-01 --end 2026-11-06 --json
+# 自定义日期区间并导出 JSON
+python scripts/analyze_tokens.py --start 2026-11-01 --end 2026-11-19 --json
 ```
 
-### 5.2 自动化日报与周报生成 (`report_daily_tokens.py`)
-
-支持生成包含核心指标、模型分布、速率指标、子代理层级分布以及 Top 消耗会话的格式化 Markdown 报告：
-
+### 5.2 自动化日报与周报 (`report_daily_tokens.py`)
 ```bash
-# 生成默认统计报告（周二至周日自动统计昨日；周一自动统计上周七天）
+# 默认模式（周二至周日统计昨日；周一自动统计过去 7 天）
 python scripts/report_daily_tokens.py
 
-# 指定审计特定日期的消耗
-python scripts/report_daily_tokens.py --date 2026-11-05
-
-# 强制执行周报周期统计
+# 指定特定日期或强制输出周报
+python scripts/report_daily_tokens.py --date 2026-11-18
 python scripts/report_daily_tokens.py --weekly
 ```
 
 ### 5.3 上下文压缩行为分析 (`analyze_compact.py`)
-
-分析历史会话中模型触发 `CHECKPOINT` 上下文压缩的具体步数、压缩前 Token 量及缩减比例，或钻取指定会话逐步轨迹：
-
 ```bash
-# 全局统计报告
+# 全局统计各模型压缩触发阈值与缩减率
 python scripts/analyze_compact.py
 
-# 钻取指定会话的逐步上下文轨迹与 CHECKPOINT 触发明细
+# 钻取单会话的逐步上下文演变与 CHECKPOINT 触发明细
 python scripts/analyze_compact.py --session <conversation-id>
 ```
 
 ### 5.4 语言服务上下文窗口配置 (`manage_token_limit.py`)
-
-修改或检查 `language_server` 运行时的上下文最大 Token 限制（支持 128K、256K、320K、384K、512K、768K、1M / 840K）：
+支持检查或配置 `language_server` 运行时上下文上限（`128K` / `256K` / `320K` / `384K` / `512K` / `768K` / `1M (840K)`），覆盖静态 JSON 槽位（`Flash 3.8 M124`、`Argon/Carbon M408`、`Claude 5.5 M400`）及云端动态模型基线（`Gemini 4 Neon M533`、`Gemini 4 Hydrogen`、`Orchestrator`、`Carbon M427`）：
 
 ```bash
-# 1. 查看当前静态 JSON 槽位、云端动态模型基线、机器码钳制与 Mendel 状态
+# 1. 查看当前静态槽位、动态云端基线、机器码钳制与 Cloud Mendel 状态
 python scripts/manage_token_limit.py --status
 
-# 2. 将全部静态与动态模型窗口升级至指定档位（例如 512K / 768K / 1M）
+# 2. 升级全部模型上下文上限（1m 自动配置为 840K 安全上限，预留 160K 空间）
 python scripts/manage_token_limit.py --set 512k
-python scripts/manage_token_limit.py --set 768k
 python scripts/manage_token_limit.py --set 1m
 
-# 3. 针对指定模型组配置（自动保护其他更高档位模型与动态基线不被截断）
+# 3. 针对指定模型范围调整
 python scripts/manage_token_limit.py --set 512k --model flash
-python scripts/manage_token_limit.py --set 1m --model argon
+python scripts/manage_token_limit.py --set 1m --model neon
 python scripts/manage_token_limit.py --set 1m --model hydrogen
 python scripts/manage_token_limit.py --set 1m --model orchestrator
 
-# 4. 恢复官方默认基线（自动校验备份构建版本，跨版本升级时安全就地还原）
+# 4. 一键恢复官方默认配置（支持构建版本校验与安全就地还原）
 python scripts/manage_token_limit.py --restore
 ```
-> 注意：配置修改后，需完全退出并重启 Antigravity 应用程序以使新的上下文水印与限制生效。
+> 注意：修改上限配置后需完全退出并重启 Antigravity 客户端使新阈值生效。
 
 ### 5.5 子代理上下文窗口压测校验 (`stress_context.py`)
-
-用于在重启 Antigravity 后实测验证目标模型（如 `Gemini 4 Hydrogen`）在真实登录会话下的上下文窗口上限是否已突破 `256K` 并按预期水位触发 `CHECKPOINT`：
-
 ```bash
-# 1. 生成单文件 < 46KB 的确定性压测载荷（建议输出至临时或 scratch 目录）
+# 1. 生成确定性压测载荷
 python scripts/stress_context.py --prepare --out-dir .stress_data --target 1m
 
-# 2. 启动子代理按提示分批（8 文件/步 + 尾部 1 文件/步精度探测）只读加载载荷后，核验实测阈值
+# 2. 通过子代理加载完毕后核验实测触发上限
 python scripts/stress_context.py --verify <subagent-conversation-id> --expected 1m
 
-# 3. 清理临时载荷文件
+# 3. 清理临时载荷
 python scripts/stress_context.py --cleanup --out-dir .stress_data
 ```
 
@@ -234,29 +223,80 @@ python scripts/stress_context.py --cleanup --out-dir .stress_data
 
 ## 6. Antigravity Skill 集成
 
-本项目完整支持作为原生技能载入 Antigravity。
+将仓库内 `skills/antigravity-token-manager` 复制到 Antigravity 技能目录即可在对话中直接调用：
 
-只需将本项目中的 `skills/antigravity-token-manager` 文件夹复制到用户配置目录下的技能库中：
 ```powershell
 Copy-Item -Path "skills/antigravity-token-manager" -Destination "$HOME\.gemini\config\skills\" -Recurse -Force
 ```
-安装后，可在 Antigravity 对话中直接调用该技能进行日常审计、消耗统计与上下文调优。
 
 ---
 
 ## 7. Web 后端 API 说明
 
-| 端点 | 请求方法 | 描述 |
+| 端点 | 方法 | 查询参数与返回说明 |
 | :--- | :--- | :--- |
-| `/api/overview` | `GET` | 获取全局统计指标（总会话数、总调用次数、Token 消耗分类、全局速率及各模型统计） |
-| `/api/sessions` | `GET` | 分页或全量获取会话列表，包含端点分布、步数、Token 消耗、TTFT 与 TPS 速率 |
-| `/api/models` | `GET` | 获取各物理端点（Gemini / Claude）的累计调用数、速率及 Token 汇总 |
-| `/api/conversations/:id` | `GET` | 查询指定会话的完整明细，包含各步的输入/输出 Token、耗时、物理端点及元数据 |
-| `/api/events` | `GET` | 基于 SSE (Server-Sent Events) 的实时事件流，底层数据库变更时自动向前端推送更新 |
+| `/api/overview` | `GET` | 支持 `?range=today\|7d\|30d\|all` 或 `?date=YYYY-MM-DD`。返回周期内汇总 Token、费用与缓存节省、压缩总数、分模型与档位速率/延迟、`contextConfig`（实测上限）及 `activeSessions`（活跃会话水位快照）。 |
+| `/api/heatmap` | `GET` | 返回全历史按自然日聚合的 `daily` 数组及 `7×24h` 活跃 `hourlyMatrix`（含 Token、费用、调用次数与压缩次数）。 |
+| `/api/sessions` | `GET` | 支持 `range`、`date`、`search`、`model`、`type`、`page`、`pageSize`。返回带实时上下文水位、压缩次数、子任务数量与估算费用的会话列表。 |
+| `/api/sessions/:id` | `GET` | 返回单会话完整逐轮轨迹（含真实 `stepIndex`、`timestampMs`、模型与思考档位、耗时、费用）、`checkpoints` 压缩事件清单、`childSessions` 关联子智能体与 `parentSession` 引用。 |
+| `/api/events` | `GET` | 基于 SSE（Server-Sent Events）的实时推送流，监听本地 SQLite 目录变更并自动触发前端无刷新同步。 |
 
 ---
 
-## 8. 免责声明（Disclaimer）
+## 8. 项目目录结构
+
+```text
+anti_token_manager/
+├── README.md                              # 项目文档与使用指南
+├── LICENSE                                # MIT 开源协议
+├── .gitignore                             # Git 忽略配置
+├── package.json                           # 根目录 NPM 启动入口
+├── requirements.txt                       # Python 运行环境说明
+├── start.bat                              # Windows 一键启动脚本
+├── docs/
+│   └── assets/                            # 演示动图、高清 MP4 视频与界面截图
+│       ├── demo-preview.gif
+│       ├── demo.mp4
+│       ├── overview-dark.png
+│       ├── overview-light.png
+│       └── session-detail.png
+├── scripts/                               # Python 零依赖审计与运维套件
+│   ├── analyze_tokens.py                  # 多周期 / 单会话 Token 与成本审计
+│   ├── report_daily_tokens.py             # 每日 / 每周报告生成器
+│   ├── analyze_compact.py                 # 上下文压缩行为与单会话轨迹分析
+│   ├── manage_token_limit.py              # 上下文窗口限制配置管理器
+│   ├── stress_context.py                  # 子代理上下文窗口压测工具
+│   ├── pricing.py                         # 双厂商费率与 model_enum 映射引擎
+│   ├── gemini_pricing.json                # 本地价格配置缓存
+│   ├── transcript.py                      # SQLite 与 JSONL 流式解析器
+│   └── formatter.py                       # 终端表格格式化与东亚宽字符对齐
+├── web/                                   # Web 实时遥测大盘
+│   ├── server.js                          # 原生 Node.js 服务 (node:sqlite + SSE)
+│   ├── index.html                         # 页面入口 (含防 FOUC color-scheme 脚本)
+│   ├── package.json                       # 前端构建依赖声明
+│   ├── tsconfig.json                      # TypeScript 配置
+│   ├── vite.config.ts                     # Vite 8 构建配置
+│   ├── dist/                              # 预编译生产静态产物 (开箱即用)
+│   └── src/
+│       ├── App.tsx                        # 总览页与独立详情路由统筹
+│       ├── types.ts                       # 类型定义、模型分档与隐私脱敏工具
+│       ├── index.css                      # 明暗双模令牌、base-select 与响应式样式
+│       ├── main.tsx                       # React 19 根入口
+│       ├── vite-env.d.ts                  # Vite 客户端类型声明
+│       └── components/
+│           ├── ContextMonitorCard.tsx     # 实时上下文监控驾驶舱
+│           ├── TokenHeatmap.tsx           # 1:1 按天日历热力图 & 7x24h 矩阵
+│           ├── SessionDetailPage.tsx      # 独立会话详情页 (锯齿波形 / 压缩胶囊 / 主子合并)
+│           └── ModelBadge.tsx             # 物理端点与思考档位微标组件
+└── skills/
+    └── antigravity-token-manager/         # Antigravity 原生 Skill 集成包
+        ├── SKILL.md
+        └── scripts/
+```
+
+---
+
+## 9. 免责声明（Disclaimer）
 
 1. 本项目仅供个人本地开发学习、性能统计与技术研究交流使用，与 Google 官方及 Google Antigravity 团队无任何隶属、合作或官方背书关系。
 2. 仓库中的 `analyze_tokens.py`、`report_daily_tokens.py`、`analyze_compact.py` 及 Web 监控服务均采用纯只读方式解析本地日志与数据库，不修改客户端状态，亦不会上传任何用户会话数据或密钥。
@@ -265,6 +305,6 @@ Copy-Item -Path "skills/antigravity-token-manager" -Destination "$HOME\.gemini\c
 
 ---
 
-## 9. 开源协议
+## 10. 开源协议
 
 本项目基于 [MIT License](LICENSE) 协议发布。
