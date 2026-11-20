@@ -66,6 +66,12 @@ FALLBACK_GEMINI_PRICING: dict[str, dict[str, Any]] = {
         "cache_read": 0.10,
         "output": 10.00,
     },
+    "gemini-pro-orchestrator-neon": {
+        "name": "Orchestrator (Neon)",
+        "input": 3.00,
+        "cache_read": 0.15,
+        "output": 15.00,
+    },
     "gemini-3.5-flash-lite": {
         "name": "Gemini 3.5 Flash-Lite",
         "input": 0.30,
@@ -194,8 +200,10 @@ MODEL_ENUM_DISPLAY_MAP: dict[int, str] = {
     1525: "Gemini 4 Hydrogen (High)",
     1526: "Gemini 4 Hydrogen (Medium)",
     1530: "Gemini 4 Hydrogen (High)",
+    1532: "Gemini 4 Neon (High)",
     1533: "Gemini 4 Neon (Medium)",
     1535: "Gemini 4 Neon (XHigh)",
+    1537: "Orchestrator (Neon)",
     1667: "Orchestrator (Carbon)",
     1669: "Gemini 3.8 Flash (Worker)",
 }
@@ -265,6 +273,7 @@ BACKEND_MODEL_DISPLAY_MAP: dict[str, str] = {
     "gemini-pro-orchestrator-g1-ultra": "Orchestrator (Carbon)",
     "gemini-pro-orchestrator-argon": "Orchestrator (Argon)",
     "gemini-pro-orchestrator-g1-pro": "Orchestrator (Argon)",
+    "gemini-pro-orchestrator-neon": "Orchestrator (Neon)",
     "gemini-flash-worker-agy": "Gemini 3.8 Flash (Worker)",
     "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
     "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
@@ -390,6 +399,8 @@ def map_model_name_to_key(model_name: str | None) -> str:
 
     # Google Gemini Orchestrator modes (must precede generic 'pro' / 'argon' / 'carbon' checks)
     if "orchestrator" in mn:
+        if "neon" in mn:
+            return "gemini-pro-orchestrator-neon"
         if "argon" in mn or "g1-pro" in mn:
             return "gemini-pro-orchestrator-argon"
         return "gemini-pro-orchestrator"
@@ -426,6 +437,8 @@ def get_model_display_name(model_name: str | None) -> str:
     if any(clean.startswith(prefix) for prefix in ("Gemini ", "Claude ", "GPT-", "Orchestrator ")):
         return clean
     if "orchestrator" in low:
+        if "neon" in low:
+            return "Orchestrator (Neon)"
         if "argon" in low or "g1-pro" in low:
             return "Orchestrator (Argon)"
         return "Orchestrator (Carbon)"

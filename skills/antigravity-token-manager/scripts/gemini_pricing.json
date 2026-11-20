@@ -47,6 +47,12 @@
     "cache_read": 0.1,
     "output": 10.0
   },
+  "gemini-pro-orchestrator-neon": {
+    "name": "Orchestrator (Neon)",
+    "input": 3.0,
+    "cache_read": 0.15,
+    "output": 15.0
+  },
   "gemini-3.5-flash-lite": {
     "name": "Gemini 3.5 Flash-Lite",
     "input": 0.3,
