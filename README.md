@@ -33,7 +33,7 @@
 
 ### 1.2 全模型物理端点与思考档位精准归因
 - 同步解码 `gen_metadata`（Protobuf 字段 19 物理端点标识）与 `steps`（`model_enum` 枚举 ID），还原全系列模型及精确思考档位：
-  - **Google Gemini 4 系列**：`gemini-4-neon (XHigh / Medium)`、`gemini-4-hydrogen (High / Medium)`、`gemini-4-hydrogen-tiered (High)`、`gemini-4-carbon (High / Medium)`、`gemini-4-argon (High)`、`gemini-pro-orchestrator (Carbon / Argon)`
+  - **Google Gemini 4 系列**：`gemini-4-neon (XHigh / High / Medium)`、`gemini-4-hydrogen (High / Medium)`、`gemini-4-hydrogen-tiered (High)`、`gemini-4-carbon (High / Medium)`、`gemini-4-argon (High)`、`gemini-pro-orchestrator (Carbon / Argon / Neon)`
   - **Google Gemini 3.x 与 Worker 系列**：`gemini-3.8-flash (High / Medium)`、`gemini-3.8-flash-tiered (High)`、`gemini-flash-worker-agy (Worker)`、`gemini-3.5-flash-lite`、`gemini-3.1-pro`
   - **Anthropic Claude 系列**：`claude-opus-5-5 (Max / High / Medium / Low)`、`claude-sonnet-5-5`、`claude-opus-4-6 (Thinking)`、`claude-sonnet-4-6`、`claude-haiku-4-5`
 - 支持在模型排行榜中按**调用量 / 最近活跃 / 吐字速率 / 低延迟**四维排序，直接横向对比同模型不同思考档位的流式输出速度（`tok/s`）与首字等待时间（`TTFT`）。
@@ -221,13 +221,26 @@ python scripts/stress_context.py --cleanup --out-dir .stress_data
 
 ---
 
-## 6. Antigravity Skill 集成
+## 6. Antigravity 原生插件集成
 
-将仓库内 `skills/antigravity-token-manager` 复制到 Antigravity 技能目录即可在对话中直接调用：
+本仓库可直接作为 **Antigravity 原生插件**（包含右侧辅助面板 Sidecar UI、零依赖只读 MCP Server、高水位预警 Hook、Skill 与 Rules）安装使用，同时保留独立 Web 与 Python CLI 形态：
 
-```powershell
-Copy-Item -Path "skills/antigravity-token-manager" -Destination "$HOME\.gemini\config\skills\" -Recurse -Force
+```bash
+# 安装精简原生插件产物到 ~/.gemini/config/plugins/antigravity-token-manager
+# --migrate-skill 会自动备份并移出旧的独立 Skill，避免同名冲突
+npm run plugin:install
+
+# 运行全链路自检（Manifest / Sidecar HTTP & SSE / MCP 4 工具 / Hook）
+npm run plugin:verify
+
+# 卸载插件
+npm run plugin:uninstall
 ```
+
+安装完成后，插件随 Antigravity 自动发现：
+- **右侧辅助面板（Sidecar UI）**：自动随插件启停，打开后默认锁定当前正在进行的对话上下文水位、剩余压缩安全空间与锯齿波形，支持窄侧栏三标签紧凑模式，并跟随宿主明暗主题。
+- **内置只读 MCP 工具**：直接提供 `token_get_overview`、`token_get_session_audit`、`token_get_context_limit`、`token_get_daily_report`，在对话中提问 Token 消耗、速率或账单即可由 Agent 直接调用。
+- **上下文高水位预警 Hook**：当单会话上下文占用超过 `85%` 时，在界面内联提醒（不占用模型输入上下文 Token，每个压缩周期仅提示一次）；可在插件数据目录的 `settings.json` 中通过 `{"enabled": false}` 或调整 `thresholdPct` 自定义。
 
 ---
 

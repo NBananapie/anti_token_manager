@@ -2388,3 +2388,209 @@ input:focus-visible,
   font-size: 12px;
   font-weight: 600;
 }
+
+/* --- Sidecar & Narrow Aux Pane Compact Adaptations --- */
+.host-follow-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+.host-follow-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-subtle);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.host-follow-btn:hover {
+  background: var(--accent-soft);
+}
+
+.compact-nav-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+}
+
+.compact-tab-btn {
+  appearance: none;
+  border: 0;
+  border-radius: 7px;
+  padding: 7px 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.compact-tab-btn.active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+}
+
+.compact-sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.compact-session-card {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  cursor: pointer;
+  transition: border-color 0.14s ease, background-color 0.14s ease;
+}
+
+.compact-session-card:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.compact-session-card.is-host {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.compact-session-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.compact-session-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.35;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.compact-session-metrics {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.app-shell.compact-mode .header-inner {
+  padding: 10px 12px;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.app-shell.compact-mode .brand-title {
+  font-size: 14px;
+}
+
+.app-shell.compact-mode .brand-subtitle {
+  font-size: 11px;
+}
+
+.app-shell.compact-mode .header-actions {
+  width: 100%;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.app-shell.compact-mode .app-main {
+  padding: 12px;
+  gap: 12px;
+}
+
+.app-shell.compact-mode .kpi-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.app-shell.compact-mode .kpi-card {
+  padding: 11px 12px;
+}
+
+.app-shell.compact-mode .kpi-value {
+  font-size: 20px;
+}
+
+.app-shell.compact-mode .panel-card {
+  padding: 12px;
+}
+
+.app-shell.compact-mode .panel-header {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.app-shell.compact-mode .ctx-selector-row {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.app-shell.compact-mode .ctx-open-btn {
+  justify-content: center;
+}
+
+.app-shell.compact-mode .ctx-footer-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.app-shell.compact-mode .model-grid {
+  grid-template-columns: 1fr;
+}
+
+.app-shell.compact-mode .toolbar-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.app-shell.compact-mode .toolbar-left,
+.app-shell.compact-mode .toolbar-right {
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.app-shell.compact-mode .search-box {
+  width: 100%;
+  min-width: 0;
+}
+
+.app-shell.compact-mode .live-pill span:last-child {
+  display: none;
+}

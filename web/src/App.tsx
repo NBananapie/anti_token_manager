@@ -41,10 +41,18 @@ import ContextMonitorCard from './components/ContextMonitorCard';
 import TokenHeatmap from './components/TokenHeatmap';
 import SessionDetailPage from './components/SessionDetailPage';
 import ModelBadge from './components/ModelBadge';
+import {
+  apiFetch,
+  createApiEventSource,
+  getHostConversationId,
+  isInSidecar,
+  observeHostTheme
+} from './sidecarBridge';
 
 type ModelSortBy = 'calls' | 'recent' | 'speed' | 'ttft';
 type TableSortKey = 'time' | 'calls' | 'speed' | 'tokens' | 'cost' | 'context';
 type SortDir = 'asc' | 'desc';
+type CompactTab = 'live' | 'stats' | 'sessions';
 
 function parseSessionIdFromHash(): string | null {
   const h = window.location.hash || '';
@@ -72,6 +80,13 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
   const [privacyMode, setPrivacyMode] = useState<boolean>(() => getInitialPrivacyMode());
+  const [inSidecar] = useState<boolean>(() => isInSidecar());
+  const [hostConversationId, setHostConversationId] = useState<string | null>(() => getHostConversationId());
+  const [followHost, setFollowHost] = useState<boolean>(true);
+  const [isCompact, setIsCompact] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 720 : false
+  );
+  const [compactTab, setCompactTab] = useState<CompactTab>('live');
 
   const handleTogglePrivacy = () => {
     setPrivacyMode((prev) => {
@@ -105,6 +120,7 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false);
 
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
+  const hostConvRef = useRef<string | null>(hostConversationId);
   const rangeRef = useRef<{ range: TimeRange; date: string | null }>({ range: timeRange, date: selectedDate });
   const savedScrollYRef = useRef<number>(0);
 
@@ -113,8 +129,35 @@ export default function App() {
   }, [activeSessionId]);
 
   useEffect(() => {
+    hostConvRef.current = hostConversationId;
+  }, [hostConversationId]);
+
+  useEffect(() => {
     rangeRef.current = { range: timeRange, date: selectedDate };
   }, [timeRange, selectedDate]);
+
+  // Responsive compact mode for Antigravity narrow Aux Pane (< 720px)
+  useEffect(() => {
+    const onResize = () => setIsCompact(window.innerWidth < 720);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // Sidecar host theme sync & active conversation tracking
+  useEffect(() => {
+    const stopTheme = observeHostTheme();
+    const timer = window.setInterval(() => {
+      const nextHostId = getHostConversationId();
+      if (nextHostId && nextHostId !== hostConvRef.current) {
+        setHostConversationId(nextHostId);
+        setFollowHost(true);
+      }
+    }, 1500);
+    return () => {
+      stopTheme();
+      window.clearInterval(timer);
+    };
+  }, []);
 
   // Cross-tab color-scheme sync
   useEffect(() => {
@@ -161,7 +204,7 @@ export default function App() {
   const fetchSessionDetail = useCallback(async (id: string, silent = false) => {
     if (!silent) setDetailLoading(true);
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
+      const res = await apiFetch(`./api/sessions/${encodeURIComponent(id)}`);
       if (res.ok) {
         const data = await res.json();
         if (activeSessionIdRef.current === id) {
@@ -181,11 +224,14 @@ export default function App() {
       const q = date
         ? `date=${encodeURIComponent(date)}`
         : `range=${encodeURIComponent(range)}`;
+      const focusParam = hostConvRef.current
+        ? `&focusConversationId=${encodeURIComponent(hostConvRef.current)}`
+        : '';
       const reqs: Promise<Response>[] = [
-        fetch(`/api/overview?${q}`),
-        fetch(`/api/sessions?${q}&pageSize=500`)
+        apiFetch(`./api/overview?${q}${focusParam}`),
+        apiFetch(`./api/sessions?${q}&pageSize=500`)
       ];
-      if (includeHeatmap) reqs.push(fetch('/api/heatmap'));
+      if (includeHeatmap) reqs.push(apiFetch('./api/heatmap'));
 
       const responses = await Promise.all(reqs);
       if (responses[0].ok) setOverview(await responses[0].json());
@@ -204,10 +250,10 @@ export default function App() {
     }
   }, []);
 
-  // Re-fetch when timeRange or selectedDate changes
+  // Re-fetch when timeRange, selectedDate, or hostConversationId changes
   useEffect(() => {
     fetchDashboardData(timeRange, selectedDate, heatmap === null);
-  }, [timeRange, selectedDate, fetchDashboardData]);
+  }, [timeRange, selectedDate, hostConversationId, fetchDashboardData]);
 
   // Fetch detail when activeSessionId changes
   useEffect(() => {
@@ -220,7 +266,7 @@ export default function App() {
 
   // SSE live updates
   useEffect(() => {
-    const es = new EventSource('/api/events');
+    const es = createApiEventSource('./api/events');
     es.onopen = () => setSseConnected(true);
     es.onmessage = (e) => {
       try {
@@ -411,7 +457,7 @@ export default function App() {
       : '加载中';
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${inSidecar ? 'in-sidecar' : ''} ${isCompact ? 'compact-mode' : ''}`}>
       {/* Compact Sticky Top Navigation */}
       <header className="app-header">
         <div className="header-inner">
@@ -520,7 +566,45 @@ export default function App() {
         />
       ) : (
         <main className="app-main">
+          {isCompact && (
+            <nav className="compact-nav-tabs" role="tablist" aria-label="侧栏视图切换">
+              {(
+                [
+                  { id: 'live', label: '实时监控' },
+                  { id: 'stats', label: '热力与模型' },
+                  { id: 'sessions', label: `会话 (${filteredSessions.length})` }
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={compactTab === tab.id}
+                  className={`compact-tab-btn ${compactTab === tab.id ? 'active' : ''}`}
+                  onClick={() => setCompactTab(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </nav>
+          )}
+
+          {/* In compact sidecar mode, prioritize Live Context Monitor at the very top */}
+          {isCompact && compactTab === 'live' && (
+            <ContextMonitorCard
+              activeSessions={overview?.activeSessions || []}
+              contextConfig={overview?.contextConfig}
+              privacyMode={privacyMode}
+              hostConversationId={hostConversationId}
+              followHost={followHost}
+              onSelectSession={(id) => setFollowHost(Boolean(hostConversationId && id === hostConversationId))}
+              onFollowHost={() => setFollowHost(true)}
+              onOpenSession={openSession}
+            />
+          )}
+
           {/* 4 Balanced KPI Cards */}
+          {(!isCompact || compactTab === 'live') && (
           <section className="kpi-grid" aria-label="核心运行指标">
             {/* KPI 1: Total Tokens & Cache Hit */}
             <article className="kpi-card">
@@ -642,23 +726,42 @@ export default function App() {
               </div>
             </article>
           </section>
+          )}
 
           {/* Dual Telemetry Deck: Live Context Monitor (5/12) + Token Heatmap (7/12) */}
-          <section className="telemetry-deck" aria-label="实时上下文监控与消耗热力图">
-            <ContextMonitorCard
-              activeSessions={overview?.activeSessions || []}
-              contextConfig={overview?.contextConfig}
-              privacyMode={privacyMode}
-              onOpenSession={openSession}
-            />
+          {!isCompact && (
+            <section className="telemetry-deck" aria-label="实时上下文监控与消耗热力图">
+              <ContextMonitorCard
+                activeSessions={overview?.activeSessions || []}
+                contextConfig={overview?.contextConfig}
+                privacyMode={privacyMode}
+                hostConversationId={hostConversationId}
+                followHost={followHost}
+                onSelectSession={(id) => setFollowHost(Boolean(hostConversationId && id === hostConversationId))}
+                onFollowHost={() => setFollowHost(true)}
+                onOpenSession={openSession}
+              />
+              <TokenHeatmap
+                data={heatmap}
+                selectedDate={selectedDate}
+                onSelectDate={(d) => setSelectedDate(d)}
+              />
+            </section>
+          )}
+
+          {isCompact && compactTab === 'stats' && (
             <TokenHeatmap
               data={heatmap}
               selectedDate={selectedDate}
-              onSelectDate={(d) => setSelectedDate(d)}
+              onSelectDate={(d) => {
+                setSelectedDate(d);
+                if (d) setCompactTab('sessions');
+              }}
             />
-          </section>
+          )}
 
           {/* Model Endpoint Leaderboard & Share Panel */}
+          {(!isCompact || compactTab === 'stats') && (
           <section className="panel-card" aria-label="模型端点分布与性能对比">
             <div className="panel-header">
               <div className="panel-title-wrap">
@@ -838,8 +941,10 @@ export default function App() {
               </div>
             )}
           </section>
+          )}
 
           {/* Sessions Toolbar & Responsive Sortable Table */}
+          {(!isCompact || compactTab === 'sessions') && (
           <section className="sessions-section" aria-label="会话路由明细">
             <div className="toolbar-row">
               <div className="toolbar-left">
@@ -929,6 +1034,74 @@ export default function App() {
               </div>
             </div>
 
+            {isCompact ? (
+              <div className="compact-sessions-list" role="list" aria-label="会话紧凑列表">
+                {loading ? (
+                  <div className="empty-cell">正在读取本地会话数据库...</div>
+                ) : filteredSessions.length === 0 ? (
+                  <div className="empty-cell">当前时间范围或筛选条件下无匹配会话</div>
+                ) : (
+                  filteredSessions.slice(0, 120).map((session) => {
+                    const totalSessTokens =
+                      session.totalInputTokens +
+                      session.totalCacheReadTokens +
+                      session.totalOutputTokens;
+                    const ctxPct =
+                      effectiveLimit > 0
+                        ? Math.min(100, ((session.currentContextTokens || 0) / effectiveLimit) * 100)
+                        : 0;
+                    const ctxHealth = getContextHealthClass(ctxPct);
+                    const displayTitle = privacyMode
+                      ? maskSessionTitle(session.conversation_id, session.sessionType, session.agentName)
+                      : session.title;
+                    const isCurrentHost = hostConversationId === session.conversation_id;
+
+                    return (
+                      <button
+                        key={session.conversation_id}
+                        type="button"
+                        className={`compact-session-card ${isCurrentHost ? 'is-host' : ''}`}
+                        onClick={() => openSession(session.conversation_id)}
+                      >
+                        <div className="compact-session-top">
+                          <div className="session-meta-row">
+                            {renderTypeTag(session)}
+                            {isCurrentHost && <span className="host-follow-pill">当前</span>}
+                            {session.childCount > 0 && (
+                              <span className="child-count-tag">+{session.childCount}</span>
+                            )}
+                          </div>
+                          <span className="cell-secondary" style={{ marginTop: 0 }}>
+                            {formatRelativeTime(session.last_modified_time)}
+                          </span>
+                        </div>
+                        <div className={`compact-session-title ${privacyMode ? 'masked' : ''}`}>
+                          {displayTitle}
+                        </div>
+                        <div className="compact-session-metrics">
+                          <span className="mono">{formatCompactTokens(totalSessTokens)}</span>
+                          <span className="mono" style={{ color: 'var(--cost)' }}>
+                            {formatUsd(session.estimatedCostUsd)}
+                          </span>
+                          <span className="mono">
+                            水位 {formatCompactTokens(session.currentContextTokens)} ({Math.round(ctxPct)}%)
+                          </span>
+                          {session.compactionCount > 0 && (
+                            <span className="cp-mini-badge">{session.compactionCount} 压</span>
+                          )}
+                        </div>
+                        <div className="table-ctx-bar" aria-hidden="true">
+                          <div
+                            className={`table-ctx-fill ${ctxHealth}`}
+                            style={{ width: `${Math.max(ctxPct, session.currentContextTokens > 0 ? 2 : 0)}%` }}
+                          />
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            ) : (
             <div
               tabIndex={0}
               role="region"
@@ -1158,7 +1331,9 @@ export default function App() {
                 </tbody>
               </table>
             </div>
+            )}
           </section>
+          )}
         </main>
       )}
     </div>

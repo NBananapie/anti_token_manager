@@ -1,0 +1,23 @@
+{
+  "command": "node",
+  "args": [
+    "../../web/server.js"
+  ],
+  "env": {
+    "ANTIGRAVITY_TOKEN_SIDECAR": "1"
+  },
+  "restart_policy": "always",
+  "display_name": "Token & 上下文监控",
+  "description": "实时监控当前对话上下文水位、剩余压缩安全空间、模型分档速率/TTFT、费用与缓存节省及 34 周消耗热力图。",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "Token & 上下文监控",
+    "views": [
+      {
+        "title": "Token & 上下文监控",
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
+      }
+    ]
+  }
+}

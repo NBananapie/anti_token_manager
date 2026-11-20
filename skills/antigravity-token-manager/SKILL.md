@@ -5,9 +5,13 @@ description: 审计 Antigravity 会话 Token 消耗并核算 Gemini 与 Claude �
 
 # Antigravity Token & Context Manager
 
-Unified toolset to audit Antigravity local session token consumption, calculate Google Gemini and Anthropic Claude model costs (via SQLite `gen_metadata` and `steps` ground-truth attribution), measure conversation output speed and latency (TTFT, streaming `tok/s`, end-to-end `tok/s`, and thinking vs visible response token splits), analyze context compaction (`CHECKPOINT`) behaviors, and manage context window limit binary configurations (`128K`, `256K`, `320K`, `384K`, `512K`, `768K`, `1M`).
+Unified native plugin and CLI toolset to audit Antigravity local session token consumption, calculate Google Gemini and Anthropic Claude model costs (via SQLite `gen_metadata` and `steps` ground-truth attribution), measure conversation output speed and latency (TTFT, streaming `tok/s`, end-to-end `tok/s`, and thinking vs visible response token splits), analyze context compaction (`CHECKPOINT`) behaviors, and manage context window limit binary configurations (`128K`, `256K`, `320K`, `384K`, `512K`, `768K`, `1M`).
 
-All execution logic is self-contained in Python standard-library scripts under `scripts/`.
+> [!TIP]
+> **Native Plugin Fast Path**: For read-only usage/cost/compaction/limit queries, prefer calling the bundled `antigravity-token-manager` MCP tools (`token_get_overview`, `token_get_session_audit`, `token_get_context_limit`, `token_get_daily_report`) directly without spawning shell commands. For live visual monitoring of the current session's context watermark and sawtooth compaction waveform, surface `[Token & 上下文监控](sidecar://antigravity-token-manager/token-monitor/)`.
+> Use the Python CLI scripts under `scripts/` below for binary context limit patching (`manage_token_limit.py`), subagent stress testing (`stress_context.py`), or offline terminal reporting.
+
+All CLI execution logic is self-contained in Python standard-library scripts under `scripts/`.
 
 ---
 

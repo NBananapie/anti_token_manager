@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react';
 import stylex from '@stylexjs/unplugin/vite';
 
 export default defineConfig({
+  base: '/',
   plugins: [
     stylex({ useCSSLayers: true, dev: process.env.NODE_ENV === 'development', runtimeInjection: false }),
     react()
@@ -18,6 +19,13 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    emptyOutDir: true
+    emptyOutDir: true,
+    modulePreload: false,
+    rollupOptions: {
+      output: {
+        format: 'iife',
+        inlineDynamicImports: true
+      }
+    }
   }
 });

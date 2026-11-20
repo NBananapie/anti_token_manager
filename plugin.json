@@ -1,0 +1,13 @@
+{
+  "name": "antigravity-token-manager",
+  "displayName": "Token & 上下文监控",
+  "description": "实时监控 Antigravity 当前会话上下文水位与压缩波形，提供双厂商（Gemini / Claude）Token 费用审计 MCP 工具、右侧辅助面板与上下文窗口上限运维套件。",
+  "version": "2.0.0",
+  "author": "NBananapie",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "统计我今天和近 7 天的 Token 消耗、模型速度与估算费用",
+    "审计当前对话（含所有派生子智能体）的上下文水位、压缩记录与总花费",
+    "检查当前 language_server 生效的上下文窗口上限状态"
+  ]
+}

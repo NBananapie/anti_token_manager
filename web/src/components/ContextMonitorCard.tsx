@@ -16,6 +16,10 @@ interface Props {
   activeSessions: ActiveSessionSnapshot[];
   contextConfig?: ContextLimitConfig;
   privacyMode?: boolean;
+  hostConversationId?: string | null;
+  followHost?: boolean;
+  onSelectSession?: (id: string) => void;
+  onFollowHost?: () => void;
   onOpenSession: (id: string) => void;
 }
 
@@ -23,19 +27,34 @@ export default function ContextMonitorCard({
   activeSessions,
   contextConfig,
   privacyMode = false,
+  hostConversationId = null,
+  followHost = true,
+  onSelectSession,
+  onFollowHost,
   onOpenSession
 }: Props) {
   const [selectedId, setSelectedId] = useState<string>('');
 
+  const hasHostMatch = Boolean(
+    hostConversationId && activeSessions.some((s) => s.conversation_id === hostConversationId)
+  );
+
   useEffect(() => {
     if (activeSessions.length === 0) return;
+    if (followHost && hostConversationId && activeSessions.some((s) => s.conversation_id === hostConversationId)) {
+      if (selectedId !== hostConversationId) {
+        setSelectedId(hostConversationId);
+      }
+      return;
+    }
     if (!selectedId || !activeSessions.some((s) => s.conversation_id === selectedId)) {
       setSelectedId(activeSessions[0].conversation_id);
     }
-  }, [activeSessions, selectedId]);
+  }, [activeSessions, selectedId, hostConversationId, followHost]);
 
   const current =
     activeSessions.find((s) => s.conversation_id === selectedId) || activeSessions[0] || null;
+  const isShowingHost = Boolean(hostConversationId && current?.conversation_id === hostConversationId);
   const limit = contextConfig?.effectiveLimit || 256000;
   const used = current?.currentContextTokens || 0;
   const remaining = Math.max(0, limit - used);
@@ -55,7 +74,22 @@ export default function ContextMonitorCard({
           <h2 className="panel-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <Gauge size={15} />
             实时上下文监控
+            {isShowingHost && (
+              <span className="host-follow-pill" title="已自动锁定当前 Antigravity 对话">
+                当前对话
+              </span>
+            )}
           </h2>
+          {hasHostMatch && !isShowingHost && onFollowHost && (
+            <button
+              type="button"
+              className="host-follow-btn"
+              onClick={onFollowHost}
+              title="切回当前正在进行的 Antigravity 对话"
+            >
+              回到当前对话
+            </button>
+          )}
         </div>
 
         <div
@@ -91,7 +125,11 @@ export default function ContextMonitorCard({
               name="liveSession"
               className="ctx-select"
               value={current.conversation_id}
-              onChange={(e) => setSelectedId(e.target.value)}
+              onChange={(e) => {
+                const nextId = e.target.value;
+                setSelectedId(nextId);
+                onSelectSession?.(nextId);
+              }}
             >
               {activeSessions.map((s, idx) => {
                 const pct = limit > 0 ? Math.round((s.currentContextTokens / limit) * 100) : 0;
@@ -100,9 +138,15 @@ export default function ContextMonitorCard({
                   : s.title.length > 30
                     ? `${s.title.slice(0, 30)}...`
                     : s.title;
+                const prefix =
+                  hostConversationId && s.conversation_id === hostConversationId
+                    ? '当前 · '
+                    : idx === 0
+                      ? '最新 · '
+                      : '';
                 return (
                   <option key={s.conversation_id} value={s.conversation_id}>
-                    {idx === 0 ? '最新 · ' : ''}
+                    {prefix}
                     {displayTitle}（{pct}% · {formatRelativeTime(s.last_modified_time)}）
                   </option>
                 );

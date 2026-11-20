@@ -8,7 +8,11 @@
     "build": "npm --prefix web run build",
     "start": "node web/server.js",
     "report": "python scripts/report_daily_tokens.py",
-    "analyze": "python scripts/analyze_tokens.py"
+    "analyze": "python scripts/analyze_tokens.py",
+    "plugin:install": "node scripts/install_plugin.mjs --copy --migrate-skill",
+    "plugin:install-link": "node scripts/install_plugin.mjs --link --migrate-skill",
+    "plugin:uninstall": "node scripts/install_plugin.mjs --uninstall",
+    "plugin:verify": "node scripts/verify_plugin.mjs"
   },
   "keywords": [
     "antigravity",

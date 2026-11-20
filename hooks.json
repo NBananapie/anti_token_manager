@@ -1,0 +1,11 @@
+{
+  "context-watermark-guard": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "node ./hooks/context-watch.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}
