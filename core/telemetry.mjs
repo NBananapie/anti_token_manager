@@ -143,6 +143,7 @@ export const MODEL_ENUM_INFO = {
   1437: { base: 'gemini-4-carbon', tier: 'Medium' },
   1525: { base: 'gemini-4-hydrogen', tier: 'High' },
   1526: { base: 'gemini-4-hydrogen', tier: 'Medium' },
+  1528: { base: 'gemini-4-hydrogen', tier: 'XHigh' },
   1530: { base: 'gemini-4-hydrogen-tiered', tier: 'High' },
   1532: { base: 'gemini-4-neon', tier: 'High' },
   1533: { base: 'gemini-4-neon', tier: 'Medium' },
@@ -151,6 +152,18 @@ export const MODEL_ENUM_INFO = {
   1667: { base: 'gemini-pro-orchestrator', tier: 'Carbon' },
   1669: { base: 'gemini-flash-worker-agy', tier: 'Worker' }
 };
+
+function normalizeTierName(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'xhigh' || s === 'extra-high' || s === 'extra_high' || s === 'extra high') return 'XHigh';
+  if (s === 'high') return 'High';
+  if (s === 'medium') return 'Medium';
+  if (s === 'low') return 'Low';
+  if (s === 'max') return 'Max';
+  if (s === 'thinking') return 'Thinking';
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
 
 export function resolveModelWithTier(rawBackendModel, modelEnum) {
   const enumInfo = modelEnum != null ? MODEL_ENUM_INFO[modelEnum] : null;
@@ -164,22 +177,29 @@ export function resolveModelWithTier(rawBackendModel, modelEnum) {
       return { model: 'unknown', rawModel: 'unknown', tier: null };
     }
   } else {
-    const orchMatch = base.match(/^(gemini-pro-orchestrator)-(neon|argon|carbon)$/i);
-    if (orchMatch) {
-      const sub = orchMatch[2].toLowerCase();
-      if (!tier) tier = sub.charAt(0).toUpperCase() + sub.slice(1);
-      base = orchMatch[1];
-    }
-    const suffixMatch = base.match(/-(xhigh|high|medium|low|max|thinking)$/i);
+    // Strip trailing thinking tier suffix first (handles both normal models and tiered orchestrators)
+    const suffixMatch = base.match(/-(extra[-_]?high|xhigh|high|medium|low|max|thinking)$/i);
     if (suffixMatch) {
-      const extracted = suffixMatch[1].toLowerCase();
-      const normalizedTier =
-        extracted === 'xhigh'
-          ? 'XHigh'
-          : extracted.charAt(0).toUpperCase() + extracted.slice(1);
+      const normalizedTier = normalizeTierName(suffixMatch[1]);
       if (!tier) tier = normalizedTier;
       base = base.slice(0, -suffixMatch[0].length);
     }
+
+    // Handle orchestrator family suffixes like gemini-pro-orchestrator-neon / -carbon / -argon
+    const orchMatch = base.match(/^(gemini-pro-orchestrator)-(neon|argon|carbon|hydrogen|opus|claude(?:-[0-9a-z.-]+)?)$/i);
+    if (orchMatch) {
+      const subRaw = orchMatch[2].toLowerCase();
+      const subLabel = subRaw.includes('opus') || subRaw.includes('claude')
+        ? 'Opus 5.5'
+        : subRaw.charAt(0).toUpperCase() + subRaw.slice(1);
+      base = orchMatch[1];
+      if (!tier) {
+        tier = subLabel;
+      } else if (!tier.toLowerCase().includes(subLabel.toLowerCase())) {
+        tier = `${subLabel} · ${tier}`;
+      }
+    }
+
     if (base.toLowerCase().includes('safety')) {
       tier = null;
     }
@@ -208,6 +228,7 @@ export function mapModelToPricingKey(modelName) {
   if (mn.includes('claude') || mn.includes('anthropic')) return 'claude-sonnet-5-5';
   if (mn.includes('orchestrator')) {
     if (mn.includes('neon')) return 'gemini-pro-orchestrator-neon';
+    if (mn.includes('hydrogen')) return 'gemini-4-hydrogen';
     return (mn.includes('argon') || mn.includes('g1-pro')) ? 'gemini-pro-orchestrator-argon' : 'gemini-pro-orchestrator';
   }
   if (mn.includes('neon')) return 'gemini-4-neon';
@@ -798,13 +819,17 @@ function parseTranscriptStepAttribution(conversationId) {
       } catch {}
     }
 
-    // Map planner step_index -> tool calls (with matched following GENERIC result byte sizes)
+    // Map planner step_index -> tool calls (with matched following GENERIC result byte sizes) & raw model string
     const plannerCallsByStep = new Map();
+    const plannerModelByStep = new Map();
     const eventsByStep = new Map();
 
     for (let i = 0; i < steps.length; i++) {
       const st = steps[i];
       if (st.type === 'PLANNER_RESPONSE') {
+        if (typeof st.model === 'string' && st.model.trim()) {
+          plannerModelByStep.set(st.step_index, st.model.trim());
+        }
         const rawTools = Array.isArray(st.tool_calls) ? st.tool_calls : [];
         const callItems = rawTools.map((tc, idx) => {
           const toolName = String(tc?.name || 'tool');
@@ -850,7 +875,7 @@ function parseTranscriptStepAttribution(conversationId) {
       }
     }
 
-    const data = { plannerCallsByStep, eventsByStep };
+    const data = { plannerCallsByStep, plannerModelByStep, eventsByStep };
     transcriptTraceCache.set(conversationId, { cacheKey, data });
     return data;
   } catch {
@@ -945,7 +970,20 @@ export function getSessionModelStats(conversationId) {
       const stepIndex = linkedStep ? linkedStep.stepIndex : (Number(parsed.metadataMap?.last_step_index) || r.idx);
       if (linkedStep) matchedStepIndices.add(linkedStep.stepIndex);
       const effEnum = linkedStep?.stepEnum ?? parsed.modelEnum ?? null;
-      const { model: resolvedModel, tier: modelTier } = resolveModelWithTier(parsed.model, effEnum);
+      let { model: resolvedModel, tier: modelTier } = resolveModelWithTier(parsed.model, effEnum);
+      // Automatic future-proof tier fallback: if a brand-new cloud modelEnum lacks a static tier entry,
+      // recover exact tier suffix from the session's transcript.jsonl PLANNER_RESPONSE.model field.
+      if (!modelTier && stepIndex != null) {
+        const tAttr = parseTranscriptStepAttribution(conversationId);
+        const tModel = tAttr?.plannerModelByStep?.get(stepIndex);
+        if (tModel) {
+          const fromTranscript = resolveModelWithTier(tModel, effEnum);
+          if (fromTranscript.tier) {
+            resolvedModel = fromTranscript.model;
+            modelTier = fromTranscript.tier;
+          }
+        }
+      }
       const timestampMs = linkedStep?.timestampMs || Math.round(effectiveMtimeMs);
       if (firstTimestampMs === null || timestampMs < firstTimestampMs) firstTimestampMs = timestampMs;
       if (lastTimestampMs === null || timestampMs > lastTimestampMs) lastTimestampMs = timestampMs;

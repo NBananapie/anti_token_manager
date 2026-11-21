@@ -199,6 +199,7 @@ MODEL_ENUM_DISPLAY_MAP: dict[int, str] = {
     1437: "Gemini 4 Carbon (Medium)",
     1525: "Gemini 4 Hydrogen (High)",
     1526: "Gemini 4 Hydrogen (Medium)",
+    1528: "Gemini 4 Hydrogen (XHigh)",
     1530: "Gemini 4 Hydrogen (High)",
     1532: "Gemini 4 Neon (High)",
     1533: "Gemini 4 Neon (Medium)",
@@ -274,6 +275,12 @@ BACKEND_MODEL_DISPLAY_MAP: dict[str, str] = {
     "gemini-pro-orchestrator-argon": "Orchestrator (Argon)",
     "gemini-pro-orchestrator-g1-pro": "Orchestrator (Argon)",
     "gemini-pro-orchestrator-neon": "Orchestrator (Neon)",
+    "gemini-pro-orchestrator-neon-xhigh": "Orchestrator (Neon · XHigh)",
+    "gemini-pro-orchestrator-neon-high": "Orchestrator (Neon · High)",
+    "gemini-pro-orchestrator-neon-medium": "Orchestrator (Neon · Medium)",
+    "gemini-pro-orchestrator-carbon-medium": "Orchestrator (Carbon · Medium)",
+    "gemini-pro-orchestrator-argon-medium": "Orchestrator (Argon · Medium)",
+    "claude-opus-5-5-orchestrator": "Orchestrator (Claude Opus 5.5)",
     "gemini-flash-worker-agy": "Gemini 3.8 Flash (Worker)",
     "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
     "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
@@ -437,11 +444,22 @@ def get_model_display_name(model_name: str | None) -> str:
     if any(clean.startswith(prefix) for prefix in ("Gemini ", "Claude ", "GPT-", "Orchestrator ")):
         return clean
     if "orchestrator" in low:
+        tier_suffix = ""
+        if "xhigh" in low or "extra-high" in low or "extra high" in low:
+            tier_suffix = " · XHigh"
+        elif "high" in low:
+            tier_suffix = " · High"
+        elif "medium" in low:
+            tier_suffix = " · Medium"
+        elif "low" in low:
+            tier_suffix = " · Low"
+        if "opus" in low or "claude" in low:
+            return f"Orchestrator (Claude Opus 5.5{tier_suffix})"
         if "neon" in low:
-            return "Orchestrator (Neon)"
+            return f"Orchestrator (Neon{tier_suffix})"
         if "argon" in low or "g1-pro" in low:
-            return "Orchestrator (Argon)"
-        return "Orchestrator (Carbon)"
+            return f"Orchestrator (Argon{tier_suffix})"
+        return f"Orchestrator (Carbon{tier_suffix})"
     if "neon" in low:
         if "xhigh" in low:
             return "Gemini 4 Neon (XHigh)"
