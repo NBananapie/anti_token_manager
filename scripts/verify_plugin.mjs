@@ -54,6 +54,9 @@ async function verifyManifests() {
   assert.ok(mcpJson.mcpServers?.telemetry, 'mcp_config.json 缺少 telemetry 服务定义');
 
   const hooksJson = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'hooks.json'), 'utf8'));
+  assert.ok(hooksJson['context-limit-watchdog']?.SessionStart?.length > 0, 'hooks.json 缺少 SessionStart');
+  assert.ok(hooksJson['budget-tool-gate']?.PreToolUse?.length > 0, 'hooks.json 缺少 PreToolUse');
+  assert.ok(hooksJson['tool-bloat-tracer']?.PostToolUse?.length > 0, 'hooks.json 缺少 PostToolUse');
   assert.ok(hooksJson['context-watermark-guard']?.PostInvocation?.length > 0, 'hooks.json 缺少 PostInvocation');
 
   assert.ok(fs.existsSync(path.join(REPO_ROOT, 'rules', 'AGENTS.md')), 'rules/AGENTS.md 缺失');
@@ -97,19 +100,24 @@ async function verifySidecarServer() {
     }
     assert.ok(healthy, 'Sidecar HTTP 服务未能在超时内启动');
 
-    const [htmlRes, ovRes, hmRes, sessRes] = await Promise.all([
+    const [htmlRes, ovRes, hmRes, sessRes, wsRes, guardRes] = await Promise.all([
       fetch(`http://127.0.0.1:${port}/`),
       fetch(`http://127.0.0.1:${port}/api/overview?range=7d`),
       fetch(`http://127.0.0.1:${port}/api/heatmap`),
-      fetch(`http://127.0.0.1:${port}/api/sessions?range=7d&pageSize=10`)
+      fetch(`http://127.0.0.1:${port}/api/sessions?range=7d&pageSize=10`),
+      fetch(`http://127.0.0.1:${port}/api/workspaces?range=7d`),
+      fetch(`http://127.0.0.1:${port}/api/guard-settings`)
     ]);
     assert.equal(htmlRes.status, 200);
     assert.equal(ovRes.status, 200);
     assert.equal(hmRes.status, 200);
     assert.equal(sessRes.status, 200);
+    assert.equal(wsRes.status, 200);
+    assert.equal(guardRes.status, 200);
 
     const overview = await ovRes.json();
     assert.ok(overview.contextConfig && typeof overview.contextConfig.effectiveLimit === 'number');
+    assert.ok(Array.isArray(overview.workspaceBreakdown));
 
     // Verify SSE handshake
     const sseController = new AbortController();
@@ -186,7 +194,11 @@ async function verifyMcpServer() {
       'token_get_overview',
       'token_get_session_audit',
       'token_get_context_limit',
-      'token_get_daily_report'
+      'token_get_daily_report',
+      'token_get_workspace_breakdown',
+      'token_find_heavy_steps',
+      'token_get_guard_settings',
+      'token_set_guard_config'
     ]) {
       assert.ok(toolNames.includes(expected), `MCP 缺少工具: ${expected}`);
     }
@@ -204,10 +216,18 @@ async function verifyMcpServer() {
     const reportRes = await rpc(5, 'tools/call', { name: 'token_get_daily_report', arguments: { weekly: true } });
     assert.equal(reportRes.result.isError, false);
 
+    const wsRes = await rpc(6, 'tools/call', { name: 'token_get_workspace_breakdown', arguments: { range: '7d' } });
+    assert.equal(wsRes.result.isError, false);
+    const wsPayload = JSON.parse(wsRes.result.content[0].text);
+    assert.ok(Array.isArray(wsPayload.workspaces));
+
+    const guardRes = await rpc(7, 'tools/call', { name: 'token_get_guard_settings', arguments: {} });
+    assert.equal(guardRes.result.isError, false);
+
     let auditedId = null;
     if (ovPayload.activeSessions && ovPayload.activeSessions.length > 0) {
       auditedId = ovPayload.activeSessions[0].conversation_id;
-      const auditRes = await rpc(6, 'tools/call', {
+      const auditRes = await rpc(8, 'tools/call', {
         name: 'token_get_session_audit',
         arguments: { conversation_id: auditedId.slice(0, 8), include_turns: false }
       });
@@ -215,19 +235,25 @@ async function verifyMcpServer() {
       const auditPayload = JSON.parse(auditRes.result.content[0].text);
       assert.equal(auditPayload.conversation_id, auditedId);
       assert.ok(auditPayload.combinedTotals && typeof auditPayload.combinedTotals.totalTokens === 'number');
+
+      const heavyRes = await rpc(9, 'tools/call', {
+        name: 'token_find_heavy_steps',
+        arguments: { conversation_id: auditedId.slice(0, 8), min_delta_tokens: 10000, top_n: 5 }
+      });
+      assert.equal(heavyRes.result.isError, false);
     }
 
-    console.log(`[PASS] 3/4 MCP Stdio 4 工具全链路校验通过 (sessions=${ovPayload.totalSessions}, audited=${auditedId ? auditedId.slice(0, 8) : 'none'})`);
+    console.log(`[PASS] 3/4 MCP Stdio 8 工具全链路校验通过 (sessions=${ovPayload.totalSessions}, workspaces=${wsPayload.workspaces.length}, audited=${auditedId ? auditedId.slice(0, 8) : 'none'})`);
   } finally {
     child.stdin.end();
     child.kill('SIGTERM');
   }
 }
 
-async function runHook(payload, dataDir) {
+async function runHookScript(relScript, payload, dataDir) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-    const child = spawn(process.execPath, ['./hooks/context-watch.mjs'], {
+    const child = spawn(process.execPath, [relScript], {
       cwd: REPO_ROOT,
       env: { ...process.env, PLUGIN_ROOT: REPO_ROOT, PLUGIN_DATA: dataDir },
       stdio: ['pipe', 'pipe', 'pipe']
@@ -237,7 +263,7 @@ async function runHook(payload, dataDir) {
     child.stdout.on('data', (c) => { out += c; });
     child.on('error', reject);
     child.on('close', (code) => {
-      if (code !== 0) reject(new Error(`Hook 退出码非 0: ${code}`));
+      if (code !== 0) reject(new Error(`Hook ${relScript} 退出码非 0: ${code}`));
       else resolve({ json: JSON.parse(out.trim()), elapsedMs: Date.now() - start });
     });
     child.stdin.end(JSON.stringify(payload));
@@ -247,31 +273,78 @@ async function runHook(payload, dataDir) {
 async function verifyHook() {
   const tmpDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-token-hook-test-'));
   try {
-    // 1. Empty conversationId should quietly return {}
-    const emptyRes = await runHook({ hookEventName: 'PostInvocation' }, tmpDataDir);
+    // 1. SessionStart limit watchdog: simulate expected limit higher than actual (or normal baseline)
+    fs.writeFileSync(
+      path.join(tmpDataDir, 'settings.json'),
+      JSON.stringify({ limitWatchEnabled: true, expectedContextLimit: 2000000 }),
+      'utf8'
+    );
+    const ss1 = await runHookScript('./hooks/session-start.mjs', { hookEventName: 'SessionStart', conversationId: 'test-conv' }, tmpDataDir);
+    const ss2 = await runHookScript('./hooks/session-start.mjs', { hookEventName: 'SessionStart', conversationId: 'test-conv' }, tmpDataDir);
+    assert.ok(ss1.json.injectSteps?.[0]?.systemMessage?.metadata?.user_markdown, 'SessionStart 上限回退未触发提醒');
+    assert.deepEqual(ss2.json, {}, 'SessionStart 同一版本未去重');
+
+    // 2. PostToolUse bloat tracer
+    const pt = await runHookScript(
+      './hooks/tool-audit.mjs',
+      {
+        hookEventName: 'PostToolUse',
+        conversationId: 'test-trace-conv',
+        stepIdx: 12,
+        toolCall: { id: 't1', name: 'read_file', args: { Path: 'd:/demo/server.js' } }
+      },
+      tmpDataDir
+    );
+    assert.deepEqual(pt.json, {});
+    const traceFile = path.join(tmpDataDir, 'tool-trace', 'test-trace-conv.jsonl');
+    assert.ok(fs.existsSync(traceFile), 'PostToolUse 未写入 tool-trace');
+
+    // 3. PreToolUse budget gate: fast allow when mode='warn', ask when over budget in 'ask' mode
+    fs.writeFileSync(
+      path.join(tmpDataDir, 'settings.json'),
+      JSON.stringify({ budgetGateMode: 'warn', dailyBudgetUsd: 0, sessionBudgetUsd: 0 }),
+      'utf8'
+    );
+    const preAllow = await runHookScript(
+      './hooks/pre-tool-budget.mjs',
+      { hookEventName: 'PreToolUse', conversationId: 'test-conv', toolCall: { name: 'run_command' } },
+      tmpDataDir
+    );
+    assert.equal(preAllow.json.decision, 'allow');
+
+    // 4. PostInvocation watermark & budget watch
+    const emptyRes = await runHookScript('./hooks/context-watch.mjs', { hookEventName: 'PostInvocation' }, tmpDataDir);
     assert.deepEqual(emptyRes.json, {});
 
-    // 2. Find an existing conversation with context > 0 and set low threshold to test alert + dedupe
     const { getOverviewData } = await import('../core/telemetry.mjs');
     const ov = getOverviewData({ range: 'all' });
     const sample = ov.activeSessions.find((s) => s.currentContextTokens > 0);
     if (sample) {
-      // Force thresholdPct=50 only if sample >= 50%, otherwise verify normal silent path
       const pct = (sample.currentContextTokens / (ov.contextConfig.effectiveLimit || 256000)) * 100;
-      fs.writeFileSync(path.join(tmpDataDir, 'settings.json'), JSON.stringify({ enabled: true, thresholdPct: 50 }), 'utf8');
-      const r1 = await runHook({ hookEventName: 'PostInvocation', conversationId: sample.conversation_id }, tmpDataDir);
-      const r2 = await runHook({ hookEventName: 'PostInvocation', conversationId: sample.conversation_id }, tmpDataDir);
-
-      if (pct >= 50) {
-        assert.ok(r1.json.injectSteps?.[0]?.systemMessage?.metadata?.user_markdown, '高水位会话未触发 user_markdown 提醒');
-        assert.equal(r1.json.injectSteps[0].systemMessage.systemMessage, '', '提醒不应注入模型上下文');
-        assert.deepEqual(r2.json, {}, '同一压缩周期二次触发未去重');
-      } else {
-        assert.deepEqual(r1.json, {});
+      fs.writeFileSync(
+        path.join(tmpDataDir, 'settings.json'),
+        JSON.stringify({ watermarkAlertEnabled: true, watermarkThresholdPct: 50, sessionBudgetUsd: 0.01, budgetGateMode: 'ask' }),
+        'utf8'
+      );
+      const preAsk = await runHookScript(
+        './hooks/pre-tool-budget.mjs',
+        { hookEventName: 'PreToolUse', conversationId: sample.conversation_id, toolCall: { name: 'run_command' } },
+        tmpDataDir
+      );
+      if (sample.estimatedCostUsd >= 0.01) {
+        assert.equal(preAsk.json.decision, 'ask', '超预算 ask 模式未触发弹窗确认');
       }
-      console.log(`[PASS] 4/4 PostInvocation Hook 校验通过 (elapsed=${r1.elapsedMs}ms, samplePct=${pct.toFixed(1)}%)`);
+
+      const r1 = await runHookScript('./hooks/context-watch.mjs', { hookEventName: 'PostInvocation', conversationId: sample.conversation_id }, tmpDataDir);
+      const r2 = await runHookScript('./hooks/context-watch.mjs', { hookEventName: 'PostInvocation', conversationId: sample.conversation_id }, tmpDataDir);
+      if (pct >= 50 || sample.estimatedCostUsd >= 0.01) {
+        assert.ok(r1.json.injectSteps?.[0]?.systemMessage?.metadata?.user_markdown, '高水位/超预算会话未触发 user_markdown 提醒');
+        assert.equal(r1.json.injectSteps[0].systemMessage.systemMessage, '', '提醒不应注入模型上下文');
+        assert.deepEqual(r2.json, {}, '同一周期二次触发未去重');
+      }
+      console.log(`[PASS] 4/4 全套 4 个生命周期 Hook 校验通过 (preAllow=${preAllow.elapsedMs}ms, postInv=${r1.elapsedMs}ms)`);
     } else {
-      console.log('[PASS] 4/4 PostInvocation Hook 基础校验通过（无活跃会话样本）');
+      console.log('[PASS] 4/4 全套 4 个生命周期 Hook 基础校验通过');
     }
   } finally {
     fs.rmSync(tmpDataDir, { recursive: true, force: true });

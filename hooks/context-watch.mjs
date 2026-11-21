@@ -1,9 +1,15 @@
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { getSingleSessionWatermark } from '../core/telemetry.mjs';
-
-const DEFAULT_THRESHOLD_PCT = 85;
+import {
+  loadGuardSettings,
+  loadJsonState,
+  saveJsonState
+} from '../core/plugin-store.mjs';
+import {
+  getSingleSessionCostUsd,
+  getSingleSessionWatermark,
+  getTodayTotalCostUsd,
+  toLocalDateKey
+} from '../core/telemetry.mjs';
 
 function readStdinText() {
   try {
@@ -15,58 +21,6 @@ function readStdinText() {
 
 function outputJson(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
-}
-
-function getDataDir() {
-  if (process.env.PLUGIN_DATA && process.env.PLUGIN_DATA.trim()) {
-    return path.resolve(process.env.PLUGIN_DATA.trim());
-  }
-  return path.join(os.tmpdir(), 'antigravity-token-manager-hook');
-}
-
-function loadSettings(dataDir) {
-  const settingsPath = path.join(dataDir, 'settings.json');
-  const defaults = { enabled: true, thresholdPct: DEFAULT_THRESHOLD_PCT };
-  if (!fs.existsSync(settingsPath)) return defaults;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    return {
-      enabled: parsed.enabled !== false,
-      thresholdPct: Number.isFinite(Number(parsed.thresholdPct))
-        ? Math.max(50, Math.min(99, Number(parsed.thresholdPct)))
-        : DEFAULT_THRESHOLD_PCT
-    };
-  } catch {
-    return defaults;
-  }
-}
-
-function loadState(statePath) {
-  if (!fs.existsSync(statePath)) return {};
-  try {
-    const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveState(statePath, state) {
-  try {
-    fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    // Trim old entries to keep state file compact
-    const keys = Object.keys(state);
-    if (keys.length > 200) {
-      for (const k of keys.slice(0, keys.length - 200)) {
-        delete state[k];
-      }
-    }
-    const tmp = `${statePath}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
-    fs.renameSync(tmp, statePath);
-  } catch {
-    // Non-fatal
-  }
 }
 
 function formatK(tokens) {
@@ -97,45 +51,79 @@ function main() {
     return;
   }
 
-  const dataDir = getDataDir();
-  const settings = loadSettings(dataDir);
-  if (!settings.enabled) {
+  const settings = loadGuardSettings();
+  const alerts = [];
+
+  // 1. Context Watermark Alert (once per compaction cycle)
+  if (settings.watermarkAlertEnabled) {
+    const watermark = getSingleSessionWatermark(conversationId);
+    if (watermark && watermark.currentContextTokens > 0 && watermark.usagePct >= settings.watermarkThresholdPct) {
+      const wmState = loadJsonState('watermark-state.json', {});
+      const prevCompactionCount = wmState[conversationId]?.compactionCount;
+      if (prevCompactionCount !== watermark.compactionCount) {
+        wmState[conversationId] = {
+          compactionCount: watermark.compactionCount,
+          alertedAt: new Date().toISOString(),
+          usagePct: watermark.usagePct
+        };
+        const keys = Object.keys(wmState);
+        if (keys.length > 200) {
+          for (const k of keys.slice(0, keys.length - 200)) delete wmState[k];
+        }
+        saveJsonState('watermark-state.json', wmState);
+
+        alerts.push(
+          `> **上下文高水位提醒**：当前会话已达 **${watermark.usagePct}%**（约 ${formatK(watermark.currentContextTokens)} / ${watermark.limitLabel}，剩余约 ${formatK(watermark.remainingTokens)}），接近自动压缩阈值。`
+        );
+      }
+    }
+  }
+
+  // 2. Session & Daily Budget Alerts (once per session / per day)
+  if (settings.sessionBudgetUsd > 0 || settings.dailyBudgetUsd > 0) {
+    const budgetState = loadJsonState('budget-alert-state.json', { sessions: {}, daily: {} });
+    if (!budgetState.sessions) budgetState.sessions = {};
+    if (!budgetState.daily) budgetState.daily = {};
+    let stateChanged = false;
+
+    if (settings.sessionBudgetUsd > 0) {
+      const sessCost = getSingleSessionCostUsd(conversationId);
+      const alertedLimit = Number(budgetState.sessions[conversationId] || 0);
+      if (sessCost >= settings.sessionBudgetUsd && alertedLimit !== settings.sessionBudgetUsd) {
+        budgetState.sessions[conversationId] = settings.sessionBudgetUsd;
+        stateChanged = true;
+        alerts.push(
+          `> **单会话预算提醒**：本会话估算费用已达 **$${sessCost.toFixed(2)}**，超出设定上限 **$${settings.sessionBudgetUsd.toFixed(2)}**。`
+        );
+      }
+    }
+
+    if (settings.dailyBudgetUsd > 0) {
+      const todayKey = toLocalDateKey(Date.now());
+      const todayCost = getTodayTotalCostUsd({ maxCacheAgeMs: 60000 });
+      const alertedLimit = Number(budgetState.daily[todayKey] || 0);
+      if (todayCost >= settings.dailyBudgetUsd && alertedLimit !== settings.dailyBudgetUsd) {
+        budgetState.daily[todayKey] = settings.dailyBudgetUsd;
+        stateChanged = true;
+        alerts.push(
+          `> **今日费用预算提醒**：今日估算总支出已达 **$${todayCost.toFixed(2)}**，超出设定日预算 **$${settings.dailyBudgetUsd.toFixed(2)}**。`
+        );
+      }
+    }
+
+    if (stateChanged) {
+      saveJsonState('budget-alert-state.json', budgetState);
+    }
+  }
+
+  if (alerts.length === 0) {
     outputJson({});
     return;
   }
 
-  const watermark = getSingleSessionWatermark(conversationId);
-  if (!watermark || watermark.currentContextTokens <= 0) {
-    outputJson({});
-    return;
-  }
-
-  if (watermark.usagePct < settings.thresholdPct) {
-    outputJson({});
-    return;
-  }
-
-  const statePath = path.join(dataDir, 'watermark-state.json');
-  const state = loadState(statePath);
-  const prevCompactionCount = state[conversationId]?.compactionCount;
-
-  // Alert at most once per compaction cycle for a given conversation
-  if (prevCompactionCount === watermark.compactionCount) {
-    outputJson({});
-    return;
-  }
-
-  state[conversationId] = {
-    compactionCount: watermark.compactionCount,
-    alertedAt: new Date().toISOString(),
-    usagePct: watermark.usagePct
-  };
-  saveState(statePath, state);
-
-  const md = [
-    `> 当前会话上下文水位已达 **${watermark.usagePct}%**（约 ${formatK(watermark.currentContextTokens)} / ${watermark.limitLabel}，剩余约 ${formatK(watermark.remainingTokens)}），接近自动压缩阈值。`,
-    `> 可点击 [Token & 上下文监控](sidecar://antigravity-token-manager/token-monitor/) 查看实时锯齿波形与缓存命中情况。`
-  ].join('\n');
+  alerts.push(
+    `> 可打开 [Token & 上下文监控](sidecar://antigravity-token-manager/token-monitor/) 查看实时波形、单步暴涨归因与预算设置。`
+  );
 
   outputJson({
     injectSteps: [
@@ -143,7 +131,7 @@ function main() {
         systemMessage: {
           systemMessage: '',
           metadata: {
-            user_markdown: md
+            user_markdown: alerts.join('\n')
           }
         }
       }

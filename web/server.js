@@ -3,13 +3,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  loadGuardSettings,
+  saveGuardSettings
+} from '../core/plugin-store.mjs';
+import {
   BASE_DIR,
   CONVERSATIONS_DIR,
   SUMMARIES_DB_PATH,
+  getContextLimitConfig,
   getHeatmapData,
   getOverviewData,
   getSessionAuditDetail,
   getSessionsList,
+  getTodayTotalCostUsd,
+  getWorkspaceBreakdown,
   invalidateMasterIndexCache
 } from '../core/telemetry.mjs';
 
@@ -140,6 +147,31 @@ function sendJson(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function readJsonBody(req, maxBytes = 65536) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8').trim();
+        resolve(text ? JSON.parse(text) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
 function resolveSafeStaticPath(pathname) {
   const relPath = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const resolvedRoot = path.resolve(PUBLIC_DIR);
@@ -233,25 +265,58 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // API: Global Overview (supports ?range=today|7d|30d|all, ?date=YYYY-MM-DD, ?focusConversationId=...)
+  // API: Guard settings (read/write $PLUGIN_DATA/settings.json)
+  if (pathname === '/api/guard-settings') {
+    if (req.method === 'GET') {
+      sendJson(res, 200, {
+        settings: loadGuardSettings(),
+        todayCostUsd: getTodayTotalCostUsd({ maxCacheAgeMs: 15000 }),
+        contextConfig: getContextLimitConfig()
+      });
+      return;
+    }
+    if (req.method === 'POST') {
+      readJsonBody(req)
+        .then((body) => {
+          const saved = saveGuardSettings(body);
+          sendJson(res, 200, { ok: true, settings: saved });
+        })
+        .catch((err) => {
+          sendJson(res, 400, { error: err instanceof Error ? err.message : 'Invalid JSON' });
+        });
+      return;
+    }
+  }
+
+  // API: Workspace Cost Breakdown
+  if (pathname === '/api/workspaces') {
+    const range = urlObj.searchParams.get('range') || '7d';
+    const date = urlObj.searchParams.get('date') || null;
+    sendJson(res, 200, getWorkspaceBreakdown({ range, date }));
+    return;
+  }
+
+  // API: Global Overview (supports ?range=today|7d|30d|all, ?date=YYYY-MM-DD, ?focusConversationId=..., ?workspace=...)
   if (pathname === '/api/overview') {
     const range = urlObj.searchParams.get('range') || '7d';
     const date = urlObj.searchParams.get('date') || null;
     const focusConversationId = urlObj.searchParams.get('focusConversationId') || null;
-    sendJson(res, 200, getOverviewData({ range, date, focusConversationId }));
+    const workspace = urlObj.searchParams.get('workspace') || null;
+    sendJson(res, 200, getOverviewData({ range, date, focusConversationId, workspace }));
     return;
   }
 
-  // API: Sessions List (supports range, date, search, model, type, pagination)
+  // API: Sessions List (supports range, date, workspace, search, model, type, pagination)
   if (pathname === '/api/sessions') {
     const range = urlObj.searchParams.get('range') || '7d';
     const date = urlObj.searchParams.get('date') || null;
+    const workspace = urlObj.searchParams.get('workspace') || null;
     const search = urlObj.searchParams.get('search') || '';
     const model = urlObj.searchParams.get('model') || '';
     const type = urlObj.searchParams.get('type') || '';
     const page = parseInt(urlObj.searchParams.get('page') || '1', 10);
     const pageSize = parseInt(urlObj.searchParams.get('pageSize') || '500', 10);
-    sendJson(res, 200, getSessionsList({ range, date, search, model, type, page, pageSize }));
+    sendJson(res, 200, getSessionsList({ range, date, workspace, search, model, type, page, pageSize }));
     return;
   }
 

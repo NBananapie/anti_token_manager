@@ -10,7 +10,10 @@ import {
   ShieldCheck,
   Terminal,
   Activity,
-  TrendingUp
+  TrendingUp,
+  ExternalLink,
+  Flame,
+  Wrench
 } from 'lucide-react';
 import {
   CheckpointEvent,
@@ -25,6 +28,7 @@ import {
   maskSessionTitle
 } from '../types';
 import ModelBadge from './ModelBadge';
+import { canJumpHostConversation, jumpToHostConversation } from '../sidecarBridge';
 
 interface Props {
   sessionId: string;
@@ -36,7 +40,14 @@ interface Props {
 }
 
 type ChartView = 'context' | 'latency';
-type TurnFilter = 'all' | 'checkpoint' | 'slow';
+type TurnFilter = 'all' | 'checkpoint' | 'bloat' | 'slow';
+
+function formatBytesShort(bytes?: number): string {
+  if (!bytes || bytes <= 0) return '';
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${bytes}B`;
+}
 
 function pickReferenceLimit(detail: SessionDetail): { limit: number; label: string; isHistorical: boolean } {
   const cfgLimit = detail.contextConfig?.effectiveLimit || 256000;
@@ -130,11 +141,16 @@ export default function SessionDetailPage({
     if (turnFilter === 'checkpoint') {
       return orderedTurns.filter((t) => cpStepSet.has(t.stepIndex));
     }
+    if (turnFilter === 'bloat') {
+      return orderedTurns.filter((t) => (t.deltaContextTokens ?? 0) >= 12000);
+    }
     if (turnFilter === 'slow') {
       return orderedTurns.filter((t) => (t.totalSec ?? 0) >= 15);
     }
     return orderedTurns;
   }, [orderedTurns, turnFilter, cpStepSet]);
+
+  const canJump = canJumpHostConversation();
 
   // Summary metrics
   const metrics = useMemo(() => {
@@ -338,6 +354,18 @@ export default function SessionDetailPage({
                   ? maskSessionTitle(detail.parentSession.conversation_id, 'main')
                   : detail.parentSession.title.slice(0, 26)}
               </span>
+            </button>
+          )}
+
+          {canJump && (
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() => jumpToHostConversation(sessionId)}
+              title="在 Antigravity 左侧主窗口直接打开此对话"
+            >
+              <ExternalLink size={13} />
+              <span>主窗口打开对话</span>
             </button>
           )}
         </div>
@@ -887,6 +915,48 @@ export default function SessionDetailPage({
                 ))}
               </div>
             )}
+            {/* Single-Step Token Bloat Attribution Strip */}
+            {detail.heavySteps && detail.heavySteps.length > 0 && (
+              <div className="bloat-strip" role="list" aria-label="单步上下文暴涨 Top 归因">
+                <span className="bloat-strip-label">
+                  <Flame size={12} />
+                  单步暴涨 Top
+                </span>
+                {detail.heavySteps.map((hs) => {
+                  const topTool = hs.tools && hs.tools.length > 0 ? hs.tools[0] : null;
+                  const extraCount = Math.max(0, (hs.tools?.length || 0) - 1);
+                  const tooltipLines = (hs.tools || [])
+                    .slice(0, 5)
+                    .map((t) => {
+                      const sz = formatBytesShort(t.bytes);
+                      const tgt = !privacyMode && t.target ? ` (${t.target})` : '';
+                      return `• ${t.toolName}${tgt}${sz ? ` · ${sz}` : ''}`;
+                    })
+                    .join('\n');
+                  return (
+                    <button
+                      key={`hs-${hs.stepIndex}`}
+                      type="button"
+                      role="listitem"
+                      className="bloat-chip"
+                      onClick={() => jumpToStep(hs.stepIndex)}
+                      title={`Step ${hs.stepIndex} 单步增长 +${hs.deltaContextTokens.toLocaleString()} tokens${tooltipLines ? `\n主要输入来源：\n${tooltipLines}` : ''}`}
+                    >
+                      <span className="bloat-delta">+{formatCompactTokens(hs.deltaContextTokens)}</span>
+                      <span className="mono">Step {hs.stepIndex}</span>
+                      {topTool && (
+                        <span className="bloat-tool-tag">
+                          {topTool.toolName}
+                          {!privacyMode && topTool.target ? ` (${topTool.target.slice(0, 20)})` : ''}
+                          {topTool.bytes ? ` · ${formatBytesShort(topTool.bytes)}` : ''}
+                          {extraCount > 0 ? ` +${extraCount}` : ''}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </section>
 
           {/* Derived Subagents Unified Billing Panel (Shown when subagents exist) */}
@@ -962,6 +1032,15 @@ export default function SessionDetailPage({
                       仅压缩节点 ({cpStepSet.size})
                     </button>
                   )}
+                  {(detail.heavySteps?.length ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      className={`seg-btn ${turnFilter === 'bloat' ? 'active' : ''}`}
+                      onClick={() => setTurnFilter('bloat')}
+                    >
+                      单步暴涨 ({detail.heavySteps?.length})
+                    </button>
+                  )}
                   <button
                     type="button"
                     className={`seg-btn ${turnFilter === 'slow' ? 'active' : ''}`}
@@ -1015,6 +1094,14 @@ export default function SessionDetailPage({
                             <span className="turn-metric-pill">
                               上下文 {formatCompactTokens(turn.contextTokens)}
                             </span>
+                            {(turn.deltaContextTokens ?? 0) >= 12000 && (
+                              <span
+                                className="turn-metric-pill bloat"
+                                title={`较上一步新增上下文 +${(turn.deltaContextTokens ?? 0).toLocaleString()} tokens`}
+                              >
+                                +{formatCompactTokens(turn.deltaContextTokens ?? 0)}
+                              </span>
+                            )}
                             {turn.streamTps != null ? (
                               <span className="turn-metric-pill speed">
                                 流式 {turn.streamTps} tok/s
@@ -1067,6 +1154,48 @@ export default function SessionDetailPage({
                             {formatUsd(turn.costUsd)}
                           </span>
                         </div>
+
+                        {turn.bloatTools && turn.bloatTools.length > 0 && (
+                          <div className="turn-tools-row">
+                            <span className="turn-tools-label" title="导致本轮上下文增长的上一步工具返回与消息来源">
+                              <Flame size={11} />
+                              输入来源
+                            </span>
+                            {turn.bloatTools.slice(0, 5).map((tl, ti) => {
+                              const sz = formatBytesShort(tl.bytes);
+                              return (
+                                <span
+                                  key={`in-${tl.stepIndex}-${ti}`}
+                                  className={`tool-attr-pill ${tl.bytes && tl.bytes >= 12000 ? 'heavy' : ''}`}
+                                  title={`${tl.toolName}${!privacyMode && tl.target ? `: ${tl.target}` : ''}${sz ? ` (${sz})` : ''}`}
+                                >
+                                  {tl.toolName}
+                                  {!privacyMode && tl.target ? `: ${tl.target.slice(0, 26)}` : ''}
+                                  {sz ? ` · ${sz}` : ''}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {turn.calledTools && turn.calledTools.length > 0 && (
+                          <div className="turn-tools-row">
+                            <span className="turn-tools-label called" title="本轮模型决策并发起的工具调用">
+                              <Wrench size={11} />
+                              本轮调用
+                            </span>
+                            {turn.calledTools.slice(0, 6).map((tl, ti) => (
+                              <span
+                                key={`call-${tl.stepIndex}-${ti}`}
+                                className="tool-attr-pill called"
+                                title={`${tl.toolName}${!privacyMode && tl.target ? `: ${tl.target}` : ''}`}
+                              >
+                                {tl.toolName}
+                                {!privacyMode && tl.target ? `: ${tl.target.slice(0, 26)}` : ''}
+                              </span>
+                            ))}
+                          </div>
+                        )}
 
                         {showTechMeta && (
                           <div className="turn-tech-footer">

@@ -5,6 +5,12 @@ declare global {
     sidecar?: {
       conversationId?: string;
       fetch?: typeof fetch;
+      getWorkspaceUris?: () => Promise<string[]>;
+      onWorkspaceChange?: (listener: (uris: string[]) => void) => () => void;
+      ui?: {
+        toggleConversation?: (conversationId: string, options?: Record<string, unknown>) => void;
+        toggleAuxPane?: (request: Record<string, unknown>) => void;
+      };
     };
   }
 }
@@ -29,6 +35,51 @@ export function getHostConversationId(): string | null {
   } catch {
     return null;
   }
+}
+
+export function canJumpHostConversation(): boolean {
+  return typeof window !== 'undefined' && typeof window.sidecar?.ui?.toggleConversation === 'function';
+}
+
+export function jumpToHostConversation(conversationId: string): boolean {
+  if (!conversationId || !canJumpHostConversation()) return false;
+  try {
+    window.sidecar!.ui!.toggleConversation!(conversationId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function subscribeHostWorkspaces(onUpdate: (uris: string[]) => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  let active = true;
+  let unsub: (() => void) | null = null;
+
+  if (typeof window.sidecar?.onWorkspaceChange === 'function') {
+    unsub = window.sidecar.onWorkspaceChange((uris) => {
+      if (active && Array.isArray(uris)) onUpdate(uris);
+    });
+  }
+  if (typeof window.sidecar?.getWorkspaceUris === 'function') {
+    window.sidecar
+      .getWorkspaceUris()
+      .then((uris) => {
+        if (active && Array.isArray(uris) && uris.length > 0) {
+          onUpdate(uris);
+        }
+      })
+      .catch(() => {});
+  }
+
+  return () => {
+    active = false;
+    if (unsub) {
+      try {
+        unsub();
+      } catch {}
+    }
+  };
 }
 
 function normalizeApiPath(apiPath: string): string {
@@ -76,10 +127,6 @@ function detectHostThemeFromRoot(): 'dark' | 'light' | null {
   }
 }
 
-/**
- * In Antigravity sidecar webviews, preload.js writes host CSS tokens (e.g. --background)
- * onto :root. When the user has not manually locked a theme override, follow the host theme.
- */
 export function observeHostTheme(): () => void {
   const sync = () => {
     try {

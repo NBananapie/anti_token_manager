@@ -2,7 +2,7 @@
   "name": "antigravity-token-manager",
   "displayName": "Token & 上下文监控",
   "description": "实时监控 Antigravity 当前会话上下文水位与压缩波形，提供双厂商（Gemini / Claude）Token 费用审计 MCP 工具、右侧辅助面板与上下文窗口上限运维套件。",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "NBananapie",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

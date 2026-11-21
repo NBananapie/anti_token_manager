@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { loadJsonState, readToolTraces, saveJsonState } from './plugin-store.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -317,7 +318,8 @@ export function getContextLimitConfig() {
       configuredLimit: clampLimit,
       cloudOverrideBypassed,
       label: formatLimitLabel(effectiveLimit),
-      binaryPath: binPath
+      binaryPath: binPath,
+      binaryMtimeMs: Math.round(stat.mtimeMs)
     };
     cachedBinaryMtime = stat.mtimeMs;
     return cachedContextConfig;
@@ -689,10 +691,172 @@ function parseGenMetadataBlob(buf) {
   }
 }
 
-// In-memory cache for parsed sessions
+// In-memory cache for parsed sessions and transcript tool traces
 const sessionCache = new Map();
+const transcriptTraceCache = new Map();
 let masterIndexCache = null;
 let lastMasterCacheTime = 0;
+
+const SENSITIVE_CMD_RE = /(api[_-]?key|token|secret|password|authorization|bearer)/i;
+
+function unwrapJsonArgString(val) {
+  if (val == null) return '';
+  if (typeof val !== 'string') return String(val);
+  const trimmed = val.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') return parsed;
+    } catch {}
+  }
+  return trimmed;
+}
+
+function summarizeTranscriptToolTarget(toolName, args) {
+  if (!args || typeof args !== 'object') return '';
+  const name = String(toolName || '').toLowerCase();
+  const pick = (k) => unwrapJsonArgString(args[k]);
+
+  const rawPath = pick('Path') || pick('path') || pick('file_path') || pick('AbsolutePath');
+  if (rawPath) {
+    const clean = rawPath.replace(/\\/g, '/');
+    const base = clean.split('/').filter(Boolean).pop() || clean;
+    const startLine = pick('StartLine');
+    const endLine = pick('EndLine');
+    const lineHint = startLine || endLine ? `:${startLine || 1}-${endLine || ''}` : '';
+    return `${base}${lineHint}`.slice(0, 56);
+  }
+  const summary = pick('toolSummary');
+  if (summary) return summary.slice(0, 56);
+
+  if (name === 'call_mcp_tool') {
+    const srv = pick('ServerName');
+    const tn = pick('ToolName');
+    if (srv || tn) return `${srv}/${tn}`.slice(0, 56);
+  }
+  const cmd = pick('CommandLine');
+  if (cmd) {
+    const oneLine = cmd.replace(/\s+/g, ' ').trim();
+    if (SENSITIVE_CMD_RE.test(oneLine)) return '[command redacted]';
+    return oneLine.slice(0, 48);
+  }
+  const query = pick('query') || pick('Query');
+  if (query) return query.slice(0, 48);
+
+  const role = pick('Role');
+  const typeName = pick('TypeName');
+  if (role || typeName) return `${typeName || 'subagent'}: ${role}`.slice(0, 56);
+
+  const url = pick('url') || pick('Url');
+  if (url) {
+    try {
+      const u = new URL(url);
+      return `${u.hostname}${u.pathname}`.slice(0, 56);
+    } catch {}
+  }
+  return '';
+}
+
+function estimateTranscriptContentBytes(content) {
+  if (!content || typeof content !== 'string') return 0;
+  let bytes = Buffer.byteLength(content, 'utf8');
+  const m = content.match(/<truncated\s+(\d+)\s+(?:of\s+(\d+)\s+)?bytes/i);
+  if (m) {
+    const totalOrMissing = Number(m[2] || m[1] || 0);
+    if (m[2]) {
+      bytes = Math.max(bytes, totalOrMissing);
+    } else {
+      bytes += totalOrMissing;
+    }
+  }
+  return bytes;
+}
+
+function parseTranscriptStepAttribution(conversationId) {
+  if (!conversationId || /[\\/:\0]/.test(conversationId)) return null;
+  const transcriptPath = path.join(BASE_DIR, 'brain', conversationId, '.system_generated', 'logs', 'transcript.jsonl');
+  if (!fs.existsSync(transcriptPath)) return null;
+
+  try {
+    const stat = fs.statSync(transcriptPath);
+    const cacheKey = `${stat.mtimeMs}:${stat.size}`;
+    const cached = transcriptTraceCache.get(conversationId);
+    if (cached && cached.cacheKey === cacheKey) {
+      return cached.data;
+    }
+
+    const raw = fs.readFileSync(transcriptPath, 'utf8');
+    const lines = raw.split('\n');
+    const steps = [];
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj && typeof obj.step_index === 'number') {
+          steps.push(obj);
+        }
+      } catch {}
+    }
+
+    // Map planner step_index -> tool calls (with matched following GENERIC result byte sizes)
+    const plannerCallsByStep = new Map();
+    const eventsByStep = new Map();
+
+    for (let i = 0; i < steps.length; i++) {
+      const st = steps[i];
+      if (st.type === 'PLANNER_RESPONSE') {
+        const rawTools = Array.isArray(st.tool_calls) ? st.tool_calls : [];
+        const callItems = rawTools.map((tc, idx) => {
+          const toolName = String(tc?.name || 'tool');
+          const target = summarizeTranscriptToolTarget(toolName, tc?.args);
+          // Match the i+1+idx GENERIC result step if it belongs to this planner turn
+          let resultBytes = 0;
+          let resultError = '';
+          const nextStep = steps[i + 1 + idx];
+          if (nextStep && nextStep.type === 'GENERIC') {
+            resultBytes = estimateTranscriptContentBytes(nextStep.content || '');
+            if (nextStep.status === 'ERROR') resultError = 'error';
+          }
+          return {
+            stepIndex: st.step_index,
+            toolName,
+            target,
+            bytes: resultBytes,
+            error: resultError
+          };
+        });
+        plannerCallsByStep.set(st.step_index, callItems);
+      } else if (st.type === 'USER_INPUT') {
+        const mediaCount = Array.isArray(st.media) ? st.media.length : 0;
+        const bytes = estimateTranscriptContentBytes(st.content || '');
+        eventsByStep.set(st.step_index, {
+          stepIndex: st.step_index,
+          toolName: 'user_input',
+          target: mediaCount > 0 ? `用户消息 (+${mediaCount} 附件)` : '用户消息',
+          bytes,
+          mediaCount
+        });
+      } else if (st.type === 'SYSTEM_MESSAGE') {
+        const bytes = estimateTranscriptContentBytes(st.content || '');
+        const contentStr = String(st.content || '');
+        const isTask = contentStr.includes('Task id');
+        const isSubagent = contentStr.includes('subagent') || contentStr.includes('conversation');
+        eventsByStep.set(st.step_index, {
+          stepIndex: st.step_index,
+          toolName: 'system_message',
+          target: isTask ? '后台任务输出回传' : isSubagent ? '系统/子代理消息' : '系统消息注入',
+          bytes
+        });
+      }
+    }
+
+    const data = { plannerCallsByStep, eventsByStep };
+    transcriptTraceCache.set(conversationId, { cacheKey, data });
+    return data;
+  } catch {
+    return null;
+  }
+}
 
 export function invalidateMasterIndexCache() {
   masterIndexCache = null;
@@ -1217,6 +1381,71 @@ export function resolveSessionInfo(id, summary) {
   };
 }
 
+export function normalizeWorkspaceKey(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let s = raw.trim();
+  if (!s) return '';
+  if (s.startsWith('file://')) {
+    try {
+      s = decodeURIComponent(s.replace(/^file:\/+/i, ''));
+    } catch {
+      s = s.replace(/^file:\/+/i, '');
+    }
+    if (!/^[a-zA-Z]:/.test(s) && !s.startsWith('/')) {
+      s = '/' + s;
+    }
+  } else {
+    try {
+      s = decodeURIComponent(s);
+    } catch {}
+  }
+  s = s.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (/^[A-Z]:\//.test(s)) {
+    s = s[0].toLowerCase() + s.slice(1);
+  }
+  return s;
+}
+
+export function extractWorkspaceLabel(normalizedKey) {
+  if (!normalizedKey) return '未关联项目';
+  const parts = normalizedKey.split('/').filter(Boolean);
+  return parts[parts.length - 1] || normalizedKey;
+}
+
+export function parseWorkspaceUris(raw) {
+  let list = [];
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) list = parsed;
+    } catch {
+      list = [raw];
+    }
+  }
+  const uris = [];
+  const keys = [];
+  const labels = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (typeof item !== 'string' || !item.trim()) continue;
+    const key = normalizeWorkspaceKey(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    uris.push(item.trim());
+    keys.push(key);
+    labels.push(extractWorkspaceLabel(key));
+  }
+  return {
+    uris,
+    keys,
+    labels,
+    primaryKey: keys[0] || '',
+    primaryLabel: labels[0] || ''
+  };
+}
+
 export function getMasterIndex() {
   const now = Date.now();
   if (masterIndexCache && now - lastMasterCacheTime < 3000) {
@@ -1347,11 +1576,23 @@ export function getMasterIndex() {
       id,
       summary,
       resolved,
+      workspaces: parseWorkspaceUris(summary?.workspace_uris),
       detail: sDetail,
       lastModifiedIso,
       firstTs,
       lastTs
     });
+  }
+
+  // Inherit parent workspace for derived subagents when summary has no workspace_uris
+  const tempMap = new Map(records.map(r => [r.id, r]));
+  for (const rec of records) {
+    if (rec.workspaces.keys.length === 0 && rec.resolved.parentId) {
+      const parent = tempMap.get(rec.resolved.parentId);
+      if (parent && parent.workspaces.keys.length > 0) {
+        rec.workspaces = parent.workspaces;
+      }
+    }
   }
 
   records.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
@@ -1403,14 +1644,26 @@ function buildActiveSnapshot(r, childrenByParent) {
     cacheSavingsUsd: r.detail.cacheSavingsUsd,
     streamTps: r.detail.streamTps,
     avgTtftSec: r.detail.avgTtftSec,
-    childCount: (childrenByParent.get(r.id) || []).length
+    childCount: (childrenByParent.get(r.id) || []).length,
+    workspaceKey: r.workspaces?.primaryKey || '',
+    workspaceLabel: r.workspaces?.primaryLabel || ''
   };
 }
 
-export function computeWindowStats(rangeStr, exactDateStr, focusConversationId = null) {
+function normalizeWorkspaceFilterSet(workspaceFilter) {
+  if (!workspaceFilter) return null;
+  const rawList = Array.isArray(workspaceFilter)
+    ? workspaceFilter
+    : String(workspaceFilter).split('|').map(s => s.trim()).filter(Boolean);
+  const keys = rawList.map(normalizeWorkspaceKey).filter(Boolean);
+  return keys.length > 0 ? new Set(keys) : null;
+}
+
+export function computeWindowStats(rangeStr, exactDateStr, focusConversationId = null, workspaceFilter = null) {
   const master = getMasterIndex();
   const bounds = getRangeBounds(rangeStr, exactDateStr);
   const contextConfig = getContextLimitConfig();
+  const filterWsSet = normalizeWorkspaceFilterSet(workspaceFilter);
 
   const inBounds = (ts) => {
     if (!ts) return bounds.startMs === null && bounds.endMs === null;
@@ -1426,6 +1679,7 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
   const modelSpeedAccMap = {};
   const globalSpeedAcc = createSpeedAcc();
   const typeCounts = { main: 0, subagent: 0, side_query: 0 };
+  const workspaceMap = new Map();
 
   let totalCalls = 0;
   let totalTokens = 0;
@@ -1443,9 +1697,11 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
   for (const rec of master.records) {
     const d = rec.detail;
     const childIds = master.childrenByParent.get(rec.id) || [];
+    const ws = rec.workspaces || { uris: [], keys: [], labels: [], primaryKey: '', primaryLabel: '' };
+    const matchesWorkspace = !filterWsSet || ws.keys.some(k => filterWsSet.has(k));
 
     if (!d || d.generations.length === 0) {
-      if (inBounds(rec.lastTs)) {
+      if (inBounds(rec.lastTs) && matchesWorkspace) {
         typeCounts[rec.resolved.sessionType] = (typeCounts[rec.resolved.sessionType] || 0) + 1;
         sessionList.push({
           conversation_id: rec.id,
@@ -1454,6 +1710,9 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
           agentName: rec.resolved.agentName,
           parentId: rec.resolved.parentId,
           childCount: childIds.length,
+          workspaceKey: ws.primaryKey,
+          workspaceLabel: ws.primaryLabel,
+          workspaceUris: ws.uris,
           preview: rec.summary?.preview || '',
           step_count: rec.summary?.step_count || 0,
           last_modified_time: rec.lastModifiedIso,
@@ -1500,12 +1759,7 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
     let sLastTs = 0;
 
     for (const g of filteredTurns) {
-      if (g.timestampMs) {
-        if (windowMinTs === null || g.timestampMs < windowMinTs) windowMinTs = g.timestampMs;
-        if (windowMaxTs === null || g.timestampMs > windowMaxTs) windowMaxTs = g.timestampMs;
-        if (g.timestampMs > sLastTs) sLastTs = g.timestampMs;
-      }
-      const tTok = g.inputTokens + g.cacheReadTokens + g.outputTokens;
+      if (g.timestampMs && g.timestampMs > sLastTs) sLastTs = g.timestampMs;
       sIn += g.inputTokens;
       sCache += g.cacheReadTokens;
       sOut += g.outputTokens;
@@ -1513,13 +1767,69 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
       sResp += g.responseTokens;
       sCost += g.costUsd;
       sSave += g.cacheSavingsUsd;
-
       sessModelCounts[g.model] = (sessModelCounts[g.model] || 0) + 1;
+      addTurnToSpeedAcc(sessSpeedAcc, g);
+    }
+
+    for (const cp of billedFilteredCps) {
+      if (cp.timestampMs && cp.timestampMs > sLastTs) sLastTs = cp.timestampMs;
+      const cpModel = cp.model || d.latestModel || 'unknown';
+      sIn += cp.inputTokens || 0;
+      sCache += cp.cacheReadTokens || 0;
+      sOut += cp.outputTokens || 0;
+      sThink += cp.thinkingTokens || 0;
+      sResp += cp.responseTokens || 0;
+      sCost += cp.costUsd || 0;
+      sSave += cp.cacheSavingsUsd || 0;
+      sessModelCounts[cpModel] = (sessModelCounts[cpModel] || 0) + 1;
+    }
+
+    const billedCalls = filteredTurns.length + billedFilteredCps.length;
+    const sTokens = sIn + sCache + sOut;
+
+    // Always aggregate workspace breakdown across all workspaces in this time window
+    const wsKey = ws.primaryKey || '__unassigned__';
+    let wsBucket = workspaceMap.get(wsKey);
+    if (!wsBucket) {
+      wsBucket = {
+        key: ws.primaryKey || '',
+        label: ws.primaryLabel || '未关联项目',
+        uri: ws.uris[0] || '',
+        sessions: 0,
+        calls: 0,
+        totalTokens: 0,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        outputTokens: 0,
+        estimatedCostUsd: 0,
+        cacheSavingsUsd: 0,
+        compactions: 0,
+        lastActiveMs: 0
+      };
+      workspaceMap.set(wsKey, wsBucket);
+    }
+    wsBucket.sessions += 1;
+    wsBucket.calls += billedCalls;
+    wsBucket.totalTokens += sTokens;
+    wsBucket.inputTokens += sIn;
+    wsBucket.cacheReadTokens += sCache;
+    wsBucket.outputTokens += sOut;
+    wsBucket.estimatedCostUsd += sCost;
+    wsBucket.cacheSavingsUsd += sSave;
+    wsBucket.compactions += filteredCps.length;
+    if (sLastTs > wsBucket.lastActiveMs) wsBucket.lastActiveMs = sLastTs;
+
+    if (!matchesWorkspace) continue;
+
+    for (const g of filteredTurns) {
+      if (g.timestampMs) {
+        if (windowMinTs === null || g.timestampMs < windowMinTs) windowMinTs = g.timestampMs;
+        if (windowMaxTs === null || g.timestampMs > windowMaxTs) windowMaxTs = g.timestampMs;
+      }
+      const tTok = g.inputTokens + g.cacheReadTokens + g.outputTokens;
       modelTotals[g.model] = (modelTotals[g.model] || 0) + 1;
       modelCosts[g.model] = (modelCosts[g.model] || 0) + g.costUsd;
       modelTokens[g.model] = (modelTokens[g.model] || 0) + tTok;
-
-      addTurnToSpeedAcc(sessSpeedAcc, g);
       addTurnToSpeedAcc(globalSpeedAcc, g);
       if (!modelSpeedAccMap[g.model]) modelSpeedAccMap[g.model] = createSpeedAcc();
       addTurnToSpeedAcc(modelSpeedAccMap[g.model], g);
@@ -1529,19 +1839,9 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
       if (cp.timestampMs) {
         if (windowMinTs === null || cp.timestampMs < windowMinTs) windowMinTs = cp.timestampMs;
         if (windowMaxTs === null || cp.timestampMs > windowMaxTs) windowMaxTs = cp.timestampMs;
-        if (cp.timestampMs > sLastTs) sLastTs = cp.timestampMs;
       }
       const cpTok = (cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0);
       const cpModel = cp.model || d.latestModel || 'unknown';
-      sIn += cp.inputTokens || 0;
-      sCache += cp.cacheReadTokens || 0;
-      sOut += cp.outputTokens || 0;
-      sThink += cp.thinkingTokens || 0;
-      sResp += cp.responseTokens || 0;
-      sCost += cp.costUsd || 0;
-      sSave += cp.cacheSavingsUsd || 0;
-
-      sessModelCounts[cpModel] = (sessModelCounts[cpModel] || 0) + 1;
       modelTotals[cpModel] = (modelTotals[cpModel] || 0) + 1;
       modelCosts[cpModel] = (modelCosts[cpModel] || 0) + (cp.costUsd || 0);
       modelTokens[cpModel] = (modelTokens[cpModel] || 0) + cpTok;
@@ -1551,12 +1851,11 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
       modelSessionCount[m] = (modelSessionCount[m] || 0) + 1;
     }
 
-    const billedCalls = filteredTurns.length + billedFilteredCps.length;
     totalCalls += billedCalls;
     totalInputTokens += sIn;
     totalCacheReadTokens += sCache;
     totalOutputTokens += sOut;
-    totalTokens += sIn + sCache + sOut;
+    totalTokens += sTokens;
     totalEstimatedCostUsd += sCost;
     totalCacheSavingsUsd += sSave;
     totalCompactions += filteredCps.length;
@@ -1571,6 +1870,9 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
       agentName: rec.resolved.agentName,
       parentId: rec.resolved.parentId,
       childCount: childIds.length,
+      workspaceKey: ws.primaryKey,
+      workspaceLabel: ws.primaryLabel,
+      workspaceUris: ws.uris,
       preview: rec.summary?.preview || '',
       step_count: rec.summary?.step_count || billedCalls,
       last_modified_time: sLastTs ? new Date(sLastTs).toISOString() : rec.lastModifiedIso,
@@ -1597,12 +1899,24 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
 
   sessionList.sort((a, b) => new Date(b.last_modified_time || 0).getTime() - new Date(a.last_modified_time || 0).getTime());
 
+  const workspaceBreakdown = Array.from(workspaceMap.values())
+    .map(w => {
+      const promptTotal = w.inputTokens + w.cacheReadTokens;
+      const cacheHitPct = promptTotal > 0 ? Number(((w.cacheReadTokens / promptTotal) * 100).toFixed(1)) : 0;
+      return {
+        ...w,
+        cacheHitPct,
+        estimatedCostUsd: Number(w.estimatedCostUsd.toFixed(2)),
+        cacheSavingsUsd: Number(w.cacheSavingsUsd.toFixed(2))
+      };
+    })
+    .sort((a, b) => b.estimatedCostUsd - a.estimatedCostUsd || b.totalTokens - a.totalTokens);
+
   const activeSessions = master.records
     .filter(r => r.detail && r.detail.totalCalls > 0 && r.resolved.sessionType === 'main')
     .slice(0, 8)
     .map(r => buildActiveSnapshot(r, master.childrenByParent));
 
-  // If sidecar requests a specific host conversationId that isn't in top 8, prepend it
   if (focusConversationId && !activeSessions.some(s => s.conversation_id === focusConversationId)) {
     const focusRec = master.recordMap.get(focusConversationId);
     if (focusRec && focusRec.detail && focusRec.detail.totalCalls > 0) {
@@ -1628,6 +1942,7 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
   return {
     range: bounds.range,
     date: bounds.date,
+    workspaceFilter: filterWsSet ? Array.from(filterWsSet) : null,
     dateFrom: windowMinTs ? toLocalDateKey(windowMinTs) : (bounds.startMs ? toLocalDateKey(bounds.startMs) : master.heatmap.minDate),
     dateTo: windowMaxTs ? toLocalDateKey(windowMaxTs) : toLocalDateKey(Date.now()),
     totalSessions: sessionList.length,
@@ -1647,6 +1962,7 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
     modelCosts: roundedModelCosts,
     modelTokens,
     modelSpeed,
+    workspaceBreakdown,
     contextConfig,
     activeSessions,
     sessions: sessionList,
@@ -1654,10 +1970,24 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
   };
 }
 
-export function getOverviewData({ range = '7d', date = null, focusConversationId = null } = {}) {
-  const stats = computeWindowStats(range, date, focusConversationId);
+export function getOverviewData({ range = '7d', date = null, focusConversationId = null, workspace = null } = {}) {
+  const stats = computeWindowStats(range, date, focusConversationId, workspace);
   const { sessions: _omit, ...overviewPayload } = stats;
   return overviewPayload;
+}
+
+export function getWorkspaceBreakdown({ range = '7d', date = null } = {}) {
+  const stats = computeWindowStats(range, date);
+  return {
+    range: stats.range,
+    date: stats.date,
+    dateFrom: stats.dateFrom,
+    dateTo: stats.dateTo,
+    totalEstimatedCostUsd: stats.totalEstimatedCostUsd,
+    totalTokens: stats.totalTokens,
+    workspaces: stats.workspaceBreakdown,
+    updatedAt: stats.updatedAt
+  };
 }
 
 export function getHeatmapData() {
@@ -1674,10 +2004,11 @@ export function getSessionsList({
   search = '',
   model = '',
   type = '',
+  workspace = null,
   page = 1,
   pageSize = 500
 } = {}) {
-  const stats = computeWindowStats(range, date);
+  const stats = computeWindowStats(range, date, null, workspace);
   const q = String(search || '').toLowerCase().trim();
   let filtered = stats.sessions;
 
@@ -1828,7 +2159,96 @@ export function getSessionAuditDetail(sessionIdOrPrefix, { includeTurns = true }
     ? Number(((detail.cacheSavingsUsd / uncached) * 100).toFixed(1))
     : 0;
 
-  const { generations, ...detailWithoutTurns } = detail;
+  // Enrich turns with context growth delta, exact transcript tool attribution (with result KB),
+  // what tools this turn invoked (calledTools), and PostToolUse fallback traces.
+  const transcriptAttr = parseTranscriptStepAttribution(resolvedId);
+  const toolTraces = readToolTraces(resolvedId);
+  const cpSteps = detail.checkpoints.map(c => c.stepIndex);
+  const enrichedGenerations = [];
+
+  for (let i = 0; i < detail.generations.length; i++) {
+    const g = detail.generations[i];
+    const prev = i > 0 ? detail.generations[i - 1] : null;
+    const prevStep = prev ? prev.stepIndex : -1;
+    const hadCompactionBetween = prev
+      ? cpSteps.some(cpStep => cpStep > prevStep && cpStep < g.stepIndex)
+      : false;
+    const deltaContextTokens = prev && !hadCompactionBetween
+      ? g.contextTokens - prev.contextTokens
+      : 0;
+
+    // 1. What tools THIS turn invoked
+    const calledTools = transcriptAttr?.plannerCallsByStep.get(g.stepIndex) || [];
+
+    // 2. What caused THIS turn's context growth (previous turn's tool outputs + user/system messages in between)
+    const growthSources = [];
+    if (transcriptAttr) {
+      if (prev) {
+        const prevCalls = transcriptAttr.plannerCallsByStep.get(prev.stepIndex) || [];
+        for (const pc of prevCalls) {
+          growthSources.push({
+            stepIndex: pc.stepIndex,
+            toolName: pc.toolName,
+            target: pc.target,
+            bytes: pc.bytes || 0,
+            error: pc.error || ''
+          });
+        }
+      }
+      for (const [evStep, ev] of transcriptAttr.eventsByStep.entries()) {
+        if (evStep > prevStep && evStep < g.stepIndex) {
+          growthSources.push({
+            stepIndex: ev.stepIndex,
+            toolName: ev.toolName,
+            target: ev.target,
+            bytes: ev.bytes || 0,
+            error: ''
+          });
+        }
+      }
+      growthSources.sort((a, b) => (b.bytes || 0) - (a.bytes || 0));
+    }
+
+    // Fallback to PostToolUse hook traces when transcript.jsonl is unavailable
+    if (growthSources.length === 0 && toolTraces.length > 0) {
+      for (const t of toolTraces) {
+        if (typeof t.stepIdx === 'number' && t.stepIdx > prevStep && t.stepIdx < g.stepIndex) {
+          growthSources.push({
+            stepIndex: t.stepIdx,
+            toolName: t.toolName || 'tool',
+            target: t.target || '',
+            bytes: 0,
+            error: t.error || ''
+          });
+        }
+      }
+    }
+
+    enrichedGenerations.push({
+      ...g,
+      deltaContextTokens,
+      isPostCompaction: hadCompactionBetween,
+      bloatTools: growthSources.slice(0, 8),
+      calledTools: calledTools.slice(0, 8)
+    });
+  }
+
+  const heavySteps = enrichedGenerations
+    .filter(g => g.deltaContextTokens >= 12000)
+    .sort((a, b) => b.deltaContextTokens - a.deltaContextTokens)
+    .slice(0, 6)
+    .map(g => ({
+      stepIndex: g.stepIndex,
+      timestampMs: g.timestampMs,
+      model: g.model,
+      deltaContextTokens: g.deltaContextTokens,
+      contextTokens: g.contextTokens,
+      costUsd: g.costUsd,
+      tools: g.bloatTools,
+      calledTools: g.calledTools
+    }));
+
+  const { generations: _rawGens, ...detailWithoutTurns } = detail;
 
   return {
     conversation_id: resolvedId,
@@ -1840,14 +2260,81 @@ export function getSessionAuditDetail(sessionIdOrPrefix, { includeTurns = true }
     childSessions,
     descendantSessions,
     combinedTotals: combined,
+    workspaceKey: rec?.workspaces?.primaryKey || '',
+    workspaceLabel: rec?.workspaces?.primaryLabel || '',
+    workspaceUris: rec?.workspaces?.uris || [],
     preview: rec?.summary?.preview || '',
     last_modified_time: rec?.lastModifiedIso || new Date(detail.lastTimestampMs).toISOString(),
     step_count: rec?.summary?.step_count || detail.totalCalls,
     cacheSavingsPct,
+    heavySteps,
     contextConfig: getContextLimitConfig(),
     ...detailWithoutTurns,
-    ...(includeTurns ? { generations } : { generationCount: generations.length })
+    ...(includeTurns ? { generations: enrichedGenerations } : { generationCount: enrichedGenerations.length })
   };
+}
+
+export function findHeavySteps(sessionIdOrPrefix, { minDeltaTokens = 15000, topN = 8 } = {}) {
+  const detail = getSessionAuditDetail(sessionIdOrPrefix, { includeTurns: true });
+  if (!detail) return null;
+  const threshold = Math.max(1000, Number(minDeltaTokens) || 15000);
+  const limitN = Math.max(1, Math.min(30, Number(topN) || 8));
+  const heavy = (detail.generations || [])
+    .filter(g => (g.deltaContextTokens || 0) >= threshold)
+    .sort((a, b) => b.deltaContextTokens - a.deltaContextTokens)
+    .slice(0, limitN)
+    .map(g => ({
+      stepIndex: g.stepIndex,
+      timestampMs: g.timestampMs,
+      model: g.model,
+      deltaContextTokens: g.deltaContextTokens,
+      contextTokens: g.contextTokens,
+      inputTokens: g.inputTokens,
+      cacheReadTokens: g.cacheReadTokens,
+      outputTokens: g.outputTokens,
+      costUsd: g.costUsd,
+      attributedTools: g.bloatTools || [],
+      calledTools: g.calledTools || []
+    }));
+
+  return {
+    conversation_id: detail.conversation_id,
+    title: detail.title,
+    totalTurns: (detail.generations || []).length,
+    minDeltaTokens: threshold,
+    heavyStepCount: heavy.length,
+    heavySteps: heavy
+  };
+}
+
+export function getSingleSessionCostUsd(conversationId) {
+  const stats = getSessionModelStats(conversationId);
+  if (!stats) return 0;
+  return Number((stats.estimatedCostUsd || 0).toFixed(4));
+}
+
+export function getTodayTotalCostUsd({ maxCacheAgeMs = 60000 } = {}) {
+  const todayKey = toLocalDateKey(Date.now());
+  const cached = loadJsonState('today-cost-cache.json', null);
+  if (
+    cached &&
+    cached.date === todayKey &&
+    typeof cached.costUsd === 'number' &&
+    typeof cached.updatedAtMs === 'number' &&
+    Date.now() - cached.updatedAtMs < maxCacheAgeMs
+  ) {
+    return cached.costUsd;
+  }
+
+  invalidateMasterIndexCache();
+  const ov = getOverviewData({ range: 'today' });
+  const costUsd = Number((ov.totalEstimatedCostUsd || 0).toFixed(2));
+  saveJsonState('today-cost-cache.json', {
+    date: todayKey,
+    costUsd,
+    updatedAtMs: Date.now()
+  });
+  return costUsd;
 }
 
 export function getDailyReportData({ date = null, weekly = false } = {}) {

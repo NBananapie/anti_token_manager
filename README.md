@@ -238,9 +238,13 @@ npm run plugin:uninstall
 ```
 
 安装完成后，插件随 Antigravity 自动发现：
-- **右侧辅助面板（Sidecar UI）**：自动随插件启停，打开后默认锁定当前正在进行的对话上下文水位、剩余压缩安全空间与锯齿波形，支持窄侧栏三标签紧凑模式，并跟随宿主明暗主题。
-- **内置只读 MCP 工具**：直接提供 `token_get_overview`、`token_get_session_audit`、`token_get_context_limit`、`token_get_daily_report`，在对话中提问 Token 消耗、速率或账单即可由 Agent 直接调用。
-- **上下文高水位预警 Hook**：当单会话上下文占用超过 `85%` 时，在界面内联提醒（不占用模型输入上下文 Token，每个压缩周期仅提示一次）；可在插件数据目录的 `settings.json` 中通过 `{"enabled": false}` 或调整 `thresholdPct` 自定义。
+- **右侧辅助面板（Sidecar UI）**：自动随插件启停，默认锁定当前对话上下文水位、剩余压缩安全空间与锯齿波形；支持按项目（Workspace）分摊成本与一键过滤当前工作区、一键跳转原对话、单步 Token 暴涨归因胶囊以及可视化守卫预算设置抽屉。
+- **内置 8 个原生 MCP 工具**：`token_get_overview`、`token_get_session_audit`、`token_get_context_limit`、`token_get_daily_report`、`token_get_workspace_breakdown`、`token_find_heavy_steps`、`token_get_guard_settings`、`token_set_guard_config`。
+- **全生命周期守卫 Hooks**：
+  - `SessionStart`：自动巡检 Antigravity 热更新是否将 `language_server` 上限覆盖回 `256K`；
+  - `PostToolUse`：轻量记录工具调用归因，在锯齿波形详情页标出单步上下文暴涨元凶；
+  - `PostInvocation`：上下文高水位（默认 `85%`）及每日/单会话费用预算超额内联提醒（不消耗模型上下文 Token）；
+  - `PreToolUse`：当预算门控设为 `ask` 模式且超出设定日/会话预算时弹窗二次确认（内置 5 分钟冷却）。
 
 ---
 

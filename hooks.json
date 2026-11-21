@@ -1,4 +1,41 @@
 {
+  "context-limit-watchdog": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./hooks/session-start.mjs",
+        "timeout": 5
+      }
+    ]
+  },
+  "budget-tool-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./hooks/pre-tool-budget.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "tool-bloat-tracer": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./hooks/tool-audit.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
   "context-watermark-guard": {
     "PostInvocation": [
       {

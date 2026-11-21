@@ -31,9 +31,56 @@ export interface ActiveSessionSnapshot {
   childCount: number;
 }
 
+export interface WorkspaceSummary {
+  key: string;
+  label: string;
+  uri: string;
+  sessions: number;
+  calls: number;
+  totalTokens: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  cacheHitPct: number;
+  estimatedCostUsd: number;
+  cacheSavingsUsd: number;
+  compactions: number;
+  lastActiveMs: number;
+}
+
+export interface ToolAttribution {
+  stepIndex: number;
+  toolName: string;
+  target: string;
+  bytes?: number;
+  error?: string;
+}
+
+export interface HeavyStepSummary {
+  stepIndex: number;
+  timestampMs: number;
+  model: string;
+  deltaContextTokens: number;
+  contextTokens: number;
+  costUsd: number;
+  tools: ToolAttribution[];
+  calledTools?: ToolAttribution[];
+}
+
+export interface GuardSettings {
+  watermarkAlertEnabled: boolean;
+  watermarkThresholdPct: number;
+  limitWatchEnabled: boolean;
+  expectedContextLimit: number | null;
+  dailyBudgetUsd: number;
+  sessionBudgetUsd: number;
+  budgetGateMode: 'warn' | 'ask';
+}
+
 export interface GlobalOverview {
   range: string;
   date: string | null;
+  workspaceFilter?: string[] | null;
   dateFrom: string | null;
   dateTo: string | null;
   totalSessions: number;
@@ -57,6 +104,7 @@ export interface GlobalOverview {
   modelCosts?: Record<string, number>;
   modelTokens?: Record<string, number>;
   modelSpeed: Record<string, SpeedMetrics>;
+  workspaceBreakdown?: WorkspaceSummary[];
   contextConfig: ContextLimitConfig;
   activeSessions: ActiveSessionSnapshot[];
   updatedAt: string;
@@ -95,6 +143,9 @@ export interface SessionItem {
   agentName: string;
   parentId: string;
   childCount: number;
+  workspaceKey?: string;
+  workspaceLabel?: string;
+  workspaceUris?: string[];
   preview: string;
   step_count: number;
   last_modified_time: string;
@@ -166,6 +217,10 @@ export interface GenerationTurn {
   totalSec: number | null;
   streamTps: number | null;
   e2eTps: number | null;
+  deltaContextTokens?: number;
+  isPostCompaction?: boolean;
+  bloatTools?: ToolAttribution[];
+  calledTools?: ToolAttribution[];
   metadata: Record<string, string>;
 }
 
@@ -175,6 +230,7 @@ export interface SessionDetail extends SessionItem {
   lastTimestampMs: number;
   cacheSavingsPct: number;
   checkpoints: CheckpointEvent[];
+  heavySteps?: HeavyStepSummary[];
   childSessions: ChildSessionSummary[];
   parentSession: { conversation_id: string; title: string } | null;
   contextConfig: ContextLimitConfig;

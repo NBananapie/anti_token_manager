@@ -18,7 +18,10 @@ import {
   Layers,
   CalendarDays,
   Eye,
-  EyeOff
+  EyeOff,
+  Shield,
+  FolderKanban,
+  ExternalLink
 } from 'lucide-react';
 import {
   GlobalOverview,
@@ -41,12 +44,16 @@ import ContextMonitorCard from './components/ContextMonitorCard';
 import TokenHeatmap from './components/TokenHeatmap';
 import SessionDetailPage from './components/SessionDetailPage';
 import ModelBadge from './components/ModelBadge';
+import GuardSettingsDrawer from './components/GuardSettingsDrawer';
 import {
   apiFetch,
+  canJumpHostConversation,
   createApiEventSource,
   getHostConversationId,
   isInSidecar,
-  observeHostTheme
+  jumpToHostConversation,
+  observeHostTheme,
+  subscribeHostWorkspaces
 } from './sidecarBridge';
 
 type ModelSortBy = 'calls' | 'recent' | 'speed' | 'ttft';
@@ -87,6 +94,10 @@ export default function App() {
     typeof window !== 'undefined' ? window.innerWidth < 720 : false
   );
   const [compactTab, setCompactTab] = useState<CompactTab>('live');
+  const [showGuardSettings, setShowGuardSettings] = useState<boolean>(false);
+  const [hostWorkspaceUris, setHostWorkspaceUris] = useState<string[]>([]);
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
+  const canJumpConv = canJumpHostConversation();
 
   const handleTogglePrivacy = () => {
     setPrivacyMode((prev) => {
@@ -121,7 +132,11 @@ export default function App() {
 
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
   const hostConvRef = useRef<string | null>(hostConversationId);
-  const rangeRef = useRef<{ range: TimeRange; date: string | null }>({ range: timeRange, date: selectedDate });
+  const rangeRef = useRef<{ range: TimeRange; date: string | null; workspace: string | null }>({
+    range: timeRange,
+    date: selectedDate,
+    workspace: selectedWorkspace
+  });
   const savedScrollYRef = useRef<number>(0);
 
   useEffect(() => {
@@ -133,8 +148,8 @@ export default function App() {
   }, [hostConversationId]);
 
   useEffect(() => {
-    rangeRef.current = { range: timeRange, date: selectedDate };
-  }, [timeRange, selectedDate]);
+    rangeRef.current = { range: timeRange, date: selectedDate, workspace: selectedWorkspace };
+  }, [timeRange, selectedDate, selectedWorkspace]);
 
   // Responsive compact mode for Antigravity narrow Aux Pane (< 720px)
   useEffect(() => {
@@ -143,9 +158,12 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  // Sidecar host theme sync & active conversation tracking
+  // Sidecar host theme sync, workspace subscription & active conversation tracking
   useEffect(() => {
     const stopTheme = observeHostTheme();
+    const stopWs = subscribeHostWorkspaces((uris) => {
+      setHostWorkspaceUris(uris);
+    });
     const timer = window.setInterval(() => {
       const nextHostId = getHostConversationId();
       if (nextHostId && nextHostId !== hostConvRef.current) {
@@ -155,6 +173,7 @@ export default function App() {
     }, 1500);
     return () => {
       stopTheme();
+      stopWs();
       window.clearInterval(timer);
     };
   }, []);
@@ -218,42 +237,46 @@ export default function App() {
     }
   }, []);
 
-  const fetchDashboardData = useCallback(async (range: TimeRange, date: string | null, includeHeatmap = false) => {
-    try {
-      setRefreshing(true);
-      const q = date
-        ? `date=${encodeURIComponent(date)}`
-        : `range=${encodeURIComponent(range)}`;
-      const focusParam = hostConvRef.current
-        ? `&focusConversationId=${encodeURIComponent(hostConvRef.current)}`
-        : '';
-      const reqs: Promise<Response>[] = [
-        apiFetch(`./api/overview?${q}${focusParam}`),
-        apiFetch(`./api/sessions?${q}&pageSize=500`)
-      ];
-      if (includeHeatmap) reqs.push(apiFetch('./api/heatmap'));
+  const fetchDashboardData = useCallback(
+    async (range: TimeRange, date: string | null, includeHeatmap = false, workspace: string | null = null) => {
+      try {
+        setRefreshing(true);
+        const q = date
+          ? `date=${encodeURIComponent(date)}`
+          : `range=${encodeURIComponent(range)}`;
+        const wsParam = workspace ? `&workspace=${encodeURIComponent(workspace)}` : '';
+        const focusParam = hostConvRef.current
+          ? `&focusConversationId=${encodeURIComponent(hostConvRef.current)}`
+          : '';
+        const reqs: Promise<Response>[] = [
+          apiFetch(`./api/overview?${q}${wsParam}${focusParam}`),
+          apiFetch(`./api/sessions?${q}${wsParam}&pageSize=500`)
+        ];
+        if (includeHeatmap) reqs.push(apiFetch('./api/heatmap'));
 
-      const responses = await Promise.all(reqs);
-      if (responses[0].ok) setOverview(await responses[0].json());
-      if (responses[1].ok) {
-        const sd = await responses[1].json();
-        setSessions(sd.sessions || []);
+        const responses = await Promise.all(reqs);
+        if (responses[0].ok) setOverview(await responses[0].json());
+        if (responses[1].ok) {
+          const sd = await responses[1].json();
+          setSessions(sd.sessions || []);
+        }
+        if (includeHeatmap && responses[2]?.ok) {
+          setHeatmap(await responses[2].json());
+        }
+      } catch (err) {
+        console.error('Fetch error:', err);
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
       }
-      if (includeHeatmap && responses[2]?.ok) {
-        setHeatmap(await responses[2].json());
-      }
-    } catch (err) {
-      console.error('Fetch error:', err);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
+    },
+    []
+  );
 
-  // Re-fetch when timeRange, selectedDate, or hostConversationId changes
+  // Re-fetch when timeRange, selectedDate, selectedWorkspace, or hostConversationId changes
   useEffect(() => {
-    fetchDashboardData(timeRange, selectedDate, heatmap === null);
-  }, [timeRange, selectedDate, hostConversationId, fetchDashboardData]);
+    fetchDashboardData(timeRange, selectedDate, heatmap === null, selectedWorkspace);
+  }, [timeRange, selectedDate, selectedWorkspace, hostConversationId, fetchDashboardData]);
 
   // Fetch detail when activeSessionId changes
   useEffect(() => {
@@ -272,8 +295,8 @@ export default function App() {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'update') {
-          const { range, date } = rangeRef.current;
-          fetchDashboardData(range, date, true);
+          const { range, date, workspace } = rangeRef.current;
+          fetchDashboardData(range, date, true, workspace);
           if (activeSessionIdRef.current) {
             fetchSessionDetail(activeSessionIdRef.current, true);
           }
@@ -285,7 +308,7 @@ export default function App() {
   }, [fetchDashboardData, fetchSessionDetail]);
 
   const handleManualRefresh = () => {
-    fetchDashboardData(timeRange, selectedDate, true);
+    fetchDashboardData(timeRange, selectedDate, true, selectedWorkspace);
     if (activeSessionId) fetchSessionDetail(activeSessionId, false);
   };
 
@@ -515,6 +538,32 @@ export default function App() {
               <span>{sseConnected ? '实时同步' : '已断开'}</span>
             </div>
 
+            {!activeSessionId && hostWorkspaceUris.length > 0 && (
+              <button
+                type="button"
+                className={`btn-ghost ${selectedWorkspace === hostWorkspaceUris.join('|') ? 'privacy-active' : ''}`}
+                onClick={() => {
+                  const hostKey = hostWorkspaceUris.join('|');
+                  setSelectedWorkspace((prev) => (prev === hostKey ? null : hostKey));
+                }}
+                title="仅统计当前 Antigravity 打开的工作区项目"
+              >
+                <FolderKanban size={13} />
+                <span>{selectedWorkspace === hostWorkspaceUris.join('|') ? '当前项目' : '按项目'}</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              className={`btn-ghost btn-icon ${showGuardSettings ? 'privacy-active' : ''}`}
+              onClick={() => setShowGuardSettings((v) => !v)}
+              aria-pressed={showGuardSettings}
+              title="预算与上下文守卫设置"
+            >
+              <Shield size={15} />
+              <span className="sr-only">预算与上下文守卫设置</span>
+            </button>
+
             <button
               type="button"
               className={`btn-ghost btn-icon ${privacyMode ? 'privacy-active' : ''}`}
@@ -566,6 +615,37 @@ export default function App() {
         />
       ) : (
         <main className="app-main">
+          <GuardSettingsDrawer
+            open={showGuardSettings}
+            onClose={() => setShowGuardSettings(false)}
+          />
+
+          {selectedWorkspace && (
+            <div className="workspace-active-banner">
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <FolderKanban size={13} />
+                <span>
+                  当前按项目筛选：
+                  <strong>
+                    {privacyMode
+                      ? '隐私项目'
+                      : overview?.workspaceBreakdown?.find(
+                          (w) => w.key === selectedWorkspace || w.uri === selectedWorkspace
+                        )?.label || selectedWorkspace.split('/').pop() || selectedWorkspace}
+                  </strong>
+                </span>
+              </div>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => setSelectedWorkspace(null)}
+              >
+                <X size={12} />
+                <span>查看全部项目</span>
+              </button>
+            </div>
+          )}
+
           {isCompact && (
             <nav className="compact-nav-tabs" role="tablist" aria-label="侧栏视图切换">
               {(
@@ -943,6 +1023,92 @@ export default function App() {
           </section>
           )}
 
+          {/* Workspace Cost Breakdown Panel */}
+          {(!isCompact || compactTab === 'stats') &&
+            overview?.workspaceBreakdown &&
+            overview.workspaceBreakdown.length > 0 && (
+              <section className="panel-card" aria-label="按项目成本分摊">
+                <div className="panel-header" style={{ marginBottom: 12 }}>
+                  <div className="panel-title-wrap">
+                    <h2
+                      className="panel-title"
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                    >
+                      <FolderKanban size={15} />
+                      按项目（Workspace）成本分摊
+                    </h2>
+                    <span className="panel-meta">
+                      共 {overview.workspaceBreakdown.length} 个项目 · 点击项目卡片可联动筛选全部指标与会话
+                    </span>
+                  </div>
+                  {selectedWorkspace && (
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={() => setSelectedWorkspace(null)}
+                    >
+                      <X size={13} />
+                      <span>显示全部项目</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="workspace-grid">
+                  {overview.workspaceBreakdown.slice(0, 8).map((ws, idx) => {
+                    const wsKey = ws.key || ws.uri;
+                    const active = Boolean(wsKey && selectedWorkspace === wsKey);
+                    const totalAllCost = overview.workspaceBreakdown!.reduce(
+                      (acc, w) => acc + (w.estimatedCostUsd || 0),
+                      0
+                    );
+                    const sharePct =
+                      totalAllCost > 0 ? Math.min(100, (ws.estimatedCostUsd / totalAllCost) * 100) : 0;
+                    const displayLabel = privacyMode
+                      ? ws.key
+                        ? `项目 #${String(idx + 1).padStart(2, '0')}`
+                        : '未关联项目'
+                      : ws.label;
+
+                    return (
+                      <button
+                        key={ws.key || `unassigned-${idx}`}
+                        type="button"
+                        className={`workspace-tile ${active ? 'active' : ''}`}
+                        disabled={!wsKey}
+                        onClick={() => {
+                          if (!wsKey) return;
+                          setSelectedWorkspace((prev) => (prev === wsKey ? null : wsKey));
+                        }}
+                        title={privacyMode ? displayLabel : ws.key || ws.label}
+                      >
+                        <div className="workspace-tile-top">
+                          <span className="workspace-tile-name">{displayLabel}</span>
+                          <span className="mono" style={{ color: 'var(--cost)', fontWeight: 700 }}>
+                            {formatUsd(ws.estimatedCostUsd)}
+                          </span>
+                        </div>
+                        <div className="model-mini-track" aria-hidden="true">
+                          <div
+                            className="model-mini-fill"
+                            style={{
+                              width: `${Math.max(sharePct, 2)}%`,
+                              backgroundColor: 'var(--accent)'
+                            }}
+                          />
+                        </div>
+                        <div className="workspace-tile-stats">
+                          <span>
+                            {ws.sessions} 会话 · {formatCompactTokens(ws.totalTokens)}
+                          </span>
+                          <span>缓存 {ws.cacheHitPct.toFixed(0)}%</span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
           {/* Sessions Toolbar & Responsive Sortable Table */}
           {(!isCompact || compactTab === 'sessions') && (
           <section className="sessions-section" aria-label="会话路由明细">
@@ -1057,11 +1223,18 @@ export default function App() {
                     const isCurrentHost = hostConversationId === session.conversation_id;
 
                     return (
-                      <button
+                      <div
                         key={session.conversation_id}
-                        type="button"
+                        role="listitem"
+                        tabIndex={0}
                         className={`compact-session-card ${isCurrentHost ? 'is-host' : ''}`}
                         onClick={() => openSession(session.conversation_id)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            openSession(session.conversation_id);
+                          }
+                        }}
                       >
                         <div className="compact-session-top">
                           <div className="session-meta-row">
@@ -1071,9 +1244,24 @@ export default function App() {
                               <span className="child-count-tag">+{session.childCount}</span>
                             )}
                           </div>
-                          <span className="cell-secondary" style={{ marginTop: 0 }}>
-                            {formatRelativeTime(session.last_modified_time)}
-                          </span>
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                            {canJumpConv && (
+                              <button
+                                type="button"
+                                className="jump-conv-btn"
+                                title="在 Antigravity 左侧主窗口打开此对话"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  jumpToHostConversation(session.conversation_id);
+                                }}
+                              >
+                                <ExternalLink size={11} />
+                              </button>
+                            )}
+                            <span className="cell-secondary" style={{ marginTop: 0 }}>
+                              {formatRelativeTime(session.last_modified_time)}
+                            </span>
+                          </div>
                         </div>
                         <div className={`compact-session-title ${privacyMode ? 'masked' : ''}`}>
                           {displayTitle}
@@ -1096,7 +1284,7 @@ export default function App() {
                             style={{ width: `${Math.max(ctxPct, session.currentContextTokens > 0 ? 2 : 0)}%` }}
                           />
                         </div>
-                      </button>
+                      </div>
                     );
                   })
                 )}
@@ -1308,6 +1496,19 @@ export default function App() {
 
                           <td style={{ textAlign: 'right' }}>
                             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                              {canJumpConv && (
+                                <button
+                                  type="button"
+                                  className="jump-conv-btn"
+                                  title="在 Antigravity 主窗口直接打开此对话"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    jumpToHostConversation(session.conversation_id);
+                                  }}
+                                >
+                                  <ExternalLink size={12} />
+                                </button>
+                              )}
                               <span
                                 className="cell-secondary"
                                 style={{ marginTop: 0 }}
