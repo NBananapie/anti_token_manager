@@ -484,28 +484,124 @@ export default function App() {
       {/* Compact Sticky Top Navigation */}
       <header className="app-header">
         <div className="header-inner">
-          <div className="brand-group">
-            <button
-              type="button"
-              className="brand-home-btn"
-              onClick={backToOverview}
-              title="返回 Antigravity Monitor 总览"
-            >
-              <span className="brand-mark" aria-hidden="true">
-                <Activity size={17} strokeWidth={2.4} />
-              </span>
-              <span className="brand-text">
-                <h1 className="brand-title">Antigravity Monitor</h1>
-                <span className="brand-subtitle">
-                  {activeSessionId ? '会话深度分析' : rangeCaption}
+          <div className="header-row-top">
+            <div className="brand-group">
+              <button
+                type="button"
+                className="brand-home-btn"
+                onClick={backToOverview}
+                title={`返回 Antigravity Monitor 总览（${rangeCaption}）`}
+              >
+                <span className="brand-mark" aria-hidden="true">
+                  <Activity size={16} strokeWidth={2.4} />
                 </span>
-              </span>
-            </button>
+                <span className="brand-text">
+                  <h1 className="brand-title">{isCompact ? 'Token Monitor' : 'Antigravity Monitor'}</h1>
+                  <span className="brand-subtitle">
+                    {activeSessionId ? '会话深度分析' : rangeCaption}
+                  </span>
+                </span>
+              </button>
+              <span
+                className={`live-dot-inline ${sseConnected ? '' : 'offline'}`}
+                title={
+                  sseConnected
+                    ? overview?.updatedAt
+                      ? `实时同步中 · ${new Date(overview.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+                      : '实时同步中'
+                    : 'SSE 连接已断开'
+                }
+                aria-label={sseConnected ? '实时同步中' : '连接已断开'}
+              />
+            </div>
+
+            <div className="header-utility-group">
+              <div
+                className={`live-pill ${sseConnected ? '' : 'offline'}`}
+                title={
+                  overview?.updatedAt
+                    ? `最近同步：${new Date(overview.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+                    : '等待本地数据库连接'
+                }
+              >
+                <span className="live-dot" aria-hidden="true" />
+                <span>{sseConnected ? '实时同步' : '已断开'}</span>
+              </div>
+
+              {!activeSessionId && hostWorkspaceUris.length > 0 && (
+                <button
+                  type="button"
+                  className={`btn-ghost ${isCompact ? 'btn-icon' : ''} ${selectedWorkspace === hostWorkspaceUris.join('|') ? 'privacy-active' : ''}`}
+                  onClick={() => {
+                    const hostKey = hostWorkspaceUris.join('|');
+                    setSelectedWorkspace((prev) => (prev === hostKey ? null : hostKey));
+                  }}
+                  title={
+                    selectedWorkspace === hostWorkspaceUris.join('|')
+                      ? '当前仅统计打开的工作区项目（点击恢复全部）'
+                      : '仅统计当前 Antigravity 打开的工作区项目'
+                  }
+                >
+                  <FolderKanban size={14} />
+                  <span className="hide-on-compact">
+                    {selectedWorkspace === hostWorkspaceUris.join('|') ? '当前项目' : '按项目'}
+                  </span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                className={`btn-ghost btn-icon ${showGuardSettings ? 'privacy-active' : ''}`}
+                onClick={() => setShowGuardSettings((v) => !v)}
+                aria-pressed={showGuardSettings}
+                title="预算与上下文守卫设置"
+              >
+                <Shield size={14} />
+                <span className="sr-only">预算与上下文守卫设置</span>
+              </button>
+
+              <button
+                type="button"
+                className={`btn-ghost btn-icon ${privacyMode ? 'privacy-active' : ''}`}
+                onClick={handleTogglePrivacy}
+                aria-pressed={privacyMode}
+                title={privacyMode ? '关闭隐私打码模式（恢复显示真实标题）' : '开启隐私打码模式（截图/录屏隐藏敏感标题）'}
+              >
+                {privacyMode ? <EyeOff size={14} /> : <Eye size={14} />}
+                <span className="sr-only">{privacyMode ? '关闭隐私打码模式' : '开启隐私打码模式'}</span>
+              </button>
+
+              <button
+                type="button"
+                className="btn-ghost btn-icon"
+                onClick={toggleColorScheme}
+                title="切换浅色 / 深色主题"
+              >
+                <span className="theme-icon-light" aria-hidden="true">
+                  <Moon size={14} />
+                </span>
+                <span className="theme-icon-dark" aria-hidden="true">
+                  <Sun size={14} />
+                </span>
+                <span className="sr-only">切换浅色或深色主题</span>
+              </button>
+
+              <button
+                type="button"
+                className={`btn-ghost ${isCompact ? 'btn-icon' : ''}`}
+                onClick={handleManualRefresh}
+                disabled={refreshing}
+                title="刷新数据"
+              >
+                <RefreshCw size={13} className={refreshing ? 'spin' : ''} />
+                <span className="hide-on-compact">刷新</span>
+              </button>
+            </div>
           </div>
 
-          <div className="header-actions">
-            {!activeSessionId && (
-              <div className="segmented" role="group" aria-label="统计时间范围">
+          {!activeSessionId && (
+            <div className="header-range-group">
+              <div className="segmented header-range-seg" role="group" aria-label="统计时间范围">
                 {(
                   [
                     { id: 'today', label: '今日' },
@@ -524,82 +620,8 @@ export default function App() {
                   </button>
                 ))}
               </div>
-            )}
-
-            <div
-              className={`live-pill ${sseConnected ? '' : 'offline'}`}
-              title={
-                overview?.updatedAt
-                  ? `最近同步：${new Date(overview.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
-                  : '等待本地数据库连接'
-              }
-            >
-              <span className="live-dot" aria-hidden="true" />
-              <span>{sseConnected ? '实时同步' : '已断开'}</span>
             </div>
-
-            {!activeSessionId && hostWorkspaceUris.length > 0 && (
-              <button
-                type="button"
-                className={`btn-ghost ${selectedWorkspace === hostWorkspaceUris.join('|') ? 'privacy-active' : ''}`}
-                onClick={() => {
-                  const hostKey = hostWorkspaceUris.join('|');
-                  setSelectedWorkspace((prev) => (prev === hostKey ? null : hostKey));
-                }}
-                title="仅统计当前 Antigravity 打开的工作区项目"
-              >
-                <FolderKanban size={13} />
-                <span>{selectedWorkspace === hostWorkspaceUris.join('|') ? '当前项目' : '按项目'}</span>
-              </button>
-            )}
-
-            <button
-              type="button"
-              className={`btn-ghost btn-icon ${showGuardSettings ? 'privacy-active' : ''}`}
-              onClick={() => setShowGuardSettings((v) => !v)}
-              aria-pressed={showGuardSettings}
-              title="预算与上下文守卫设置"
-            >
-              <Shield size={15} />
-              <span className="sr-only">预算与上下文守卫设置</span>
-            </button>
-
-            <button
-              type="button"
-              className={`btn-ghost btn-icon ${privacyMode ? 'privacy-active' : ''}`}
-              onClick={handleTogglePrivacy}
-              aria-pressed={privacyMode}
-              title={privacyMode ? '关闭隐私打码模式（恢复显示真实标题）' : '开启隐私打码模式（截图/录屏隐藏敏感标题）'}
-            >
-              {privacyMode ? <EyeOff size={15} /> : <Eye size={15} />}
-              <span className="sr-only">{privacyMode ? '关闭隐私打码模式' : '开启隐私打码模式'}</span>
-            </button>
-
-            <button
-              type="button"
-              className="btn-ghost btn-icon"
-              onClick={toggleColorScheme}
-              title="切换浅色 / 深色主题"
-            >
-              <span className="theme-icon-light" aria-hidden="true">
-                <Moon size={15} />
-              </span>
-              <span className="theme-icon-dark" aria-hidden="true">
-                <Sun size={15} />
-              </span>
-              <span className="sr-only">切换浅色或深色主题</span>
-            </button>
-
-            <button
-              type="button"
-              className="btn-ghost"
-              onClick={handleManualRefresh}
-              disabled={refreshing}
-            >
-              <RefreshCw size={13} className={refreshing ? 'spin' : ''} />
-              <span>刷新</span>
-            </button>
-          </div>
+          )}
         </div>
       </header>
 
@@ -675,6 +697,7 @@ export default function App() {
               activeSessions={overview?.activeSessions || []}
               contextConfig={overview?.contextConfig}
               privacyMode={privacyMode}
+              compact={true}
               hostConversationId={hostConversationId}
               followHost={followHost}
               onSelectSession={(id) => setFollowHost(Boolean(hostConversationId && id === hostConversationId))}
@@ -689,7 +712,7 @@ export default function App() {
             {/* KPI 1: Total Tokens & Cache Hit */}
             <article className="kpi-card">
               <div className="kpi-top">
-                <span className="kpi-label">周期 Token 流转与缓存效率</span>
+                <span className="kpi-label">{isCompact ? 'Token 与缓存' : '周期 Token 流转与缓存效率'}</span>
                 <span className="kpi-icon" aria-hidden="true">
                   <Layers size={15} />
                 </span>
@@ -705,9 +728,9 @@ export default function App() {
               </div>
               <div>
                 <div className="kpi-sub">
-                  <span>缓存命中 {cacheHitPct.toFixed(1)}%</span>
-                  <span>·</span>
-                  <span>缓存读取 {overview ? formatCompactTokens(overview.totalCacheReadTokens) : '-'}</span>
+                  <span>命中 {cacheHitPct.toFixed(1)}%</span>
+                  <span className="kpi-sep">·</span>
+                  <span>缓存 {overview ? formatCompactTokens(overview.totalCacheReadTokens) : '-'}</span>
                 </div>
                 <div className="kpi-bar-track" aria-hidden="true">
                   <div className="kpi-bar-fill" style={{ width: `${Math.min(100, cacheHitPct)}%` }} />
@@ -718,7 +741,7 @@ export default function App() {
             {/* KPI 2: Estimated Cost & Cache Savings */}
             <article className="kpi-card">
               <div className="kpi-top">
-                <span className="kpi-label">估算费用与缓存节省</span>
+                <span className="kpi-label">{isCompact ? '估算费用' : '估算费用与缓存节省'}</span>
                 {overview && overview.cacheSavingsPct > 0 ? (
                   <span className="savings-pill">省 {overview.cacheSavingsPct}%</span>
                 ) : (
@@ -734,16 +757,16 @@ export default function App() {
                 <span className="kpi-unit">USD</span>
               </div>
               <div className="kpi-sub">
-                <span>缓存已省 {overview ? formatUsd(overview.totalCacheSavingsUsd) : '-'}</span>
-                <span>·</span>
-                <span>{overview?.totalCalls.toLocaleString() ?? '-'} 次推理</span>
+                <span>已省 {overview ? formatUsd(overview.totalCacheSavingsUsd) : '-'}</span>
+                <span className="kpi-sep">·</span>
+                <span>{overview?.totalCalls.toLocaleString() ?? '-'} 步</span>
               </div>
             </article>
 
             {/* KPI 3: Streaming Speed & TTFT */}
             <article className="kpi-card">
               <div className="kpi-top">
-                <span className="kpi-label">加权流式输出速率</span>
+                <span className="kpi-label">{isCompact ? '流式输出速率' : '加权流式输出速率'}</span>
                 <span className="kpi-icon" aria-hidden="true">
                   <Activity size={15} />
                 </span>
@@ -755,10 +778,10 @@ export default function App() {
                 <span className="kpi-unit">tok/s</span>
               </div>
               <div className="kpi-sub">
-                <span>端到端 {overview?.globalSpeed?.e2eTps ?? '-'} tok/s</span>
-                <span>·</span>
+                <span>E2E {overview?.globalSpeed?.e2eTps ?? '-'}</span>
+                <span className="kpi-sep">·</span>
                 <span>TTFT {overview?.globalSpeed?.avgTtftSec ?? '-'}s</span>
-                <span>·</span>
+                <span className="kpi-sep">·</span>
                 <span>思考 {overview?.globalSpeed?.thinkingSharePct ?? 0}%</span>
               </div>
             </article>
@@ -766,7 +789,7 @@ export default function App() {
             {/* KPI 4: Sessions & Compactions */}
             <article className="kpi-card">
               <div className="kpi-top">
-                <span className="kpi-label">周期会话与压缩统计</span>
+                <span className="kpi-label">{isCompact ? '会话与压缩' : '周期会话与压缩统计'}</span>
                 <span className="kpi-icon" aria-hidden="true">
                   <Database size={15} />
                 </span>
@@ -776,7 +799,7 @@ export default function App() {
                   {overview?.totalSessions.toLocaleString() ?? '-'}
                 </span>
                 <span className="kpi-unit">
-                  会话 · {overview?.totalCompactions ?? 0} 次压缩
+                  会话 · {overview?.totalCompactions ?? 0} 压
                 </span>
               </div>
               <div className="kpi-inline-links">
@@ -785,7 +808,7 @@ export default function App() {
                   className="kpi-link-btn"
                   onClick={() => setSelectedType(selectedType === 'main' ? 'ALL' : 'main')}
                 >
-                  主会话 {overview?.typeCounts?.main ?? 0}
+                  主 {overview?.typeCounts?.main ?? 0}
                 </button>
                 <span className="panel-meta">·</span>
                 <button
@@ -793,7 +816,7 @@ export default function App() {
                   className="kpi-link-btn"
                   onClick={() => setSelectedType(selectedType === 'subagent' ? 'ALL' : 'subagent')}
                 >
-                  子任务 {overview?.typeCounts?.subagent ?? 0}
+                  子 {overview?.typeCounts?.subagent ?? 0}
                 </button>
                 <span className="panel-meta">·</span>
                 <button
@@ -801,7 +824,7 @@ export default function App() {
                   className="kpi-link-btn"
                   onClick={() => setSelectedType(selectedType === 'side_query' ? 'ALL' : 'side_query')}
                 >
-                  侧栏 {overview?.typeCounts?.side_query ?? 0}
+                  侧 {overview?.typeCounts?.side_query ?? 0}
                 </button>
               </div>
             </article>

@@ -16,6 +16,7 @@ interface Props {
   activeSessions: ActiveSessionSnapshot[];
   contextConfig?: ContextLimitConfig;
   privacyMode?: boolean;
+  compact?: boolean;
   hostConversationId?: string | null;
   followHost?: boolean;
   onSelectSession?: (id: string) => void;
@@ -27,6 +28,7 @@ export default function ContextMonitorCard({
   activeSessions,
   contextConfig,
   privacyMode = false,
+  compact = false,
   hostConversationId = null,
   followHost = true,
   onSelectSession,
@@ -133,10 +135,11 @@ export default function ContextMonitorCard({
             >
               {activeSessions.map((s, idx) => {
                 const pct = limit > 0 ? Math.round((s.currentContextTokens / limit) * 100) : 0;
+                const maxTitleLen = compact ? 16 : 30;
                 const displayTitle = privacyMode
                   ? maskSessionTitle(s.conversation_id, 'main')
-                  : s.title.length > 30
-                    ? `${s.title.slice(0, 30)}...`
+                  : s.title.length > maxTitleLen
+                    ? `${s.title.slice(0, maxTitleLen)}...`
                     : s.title;
                 const prefix =
                   hostConversationId && s.conversation_id === hostConversationId
@@ -147,7 +150,8 @@ export default function ContextMonitorCard({
                 return (
                   <option key={s.conversation_id} value={s.conversation_id}>
                     {prefix}
-                    {displayTitle}（{pct}% · {formatRelativeTime(s.last_modified_time)}）
+                    {displayTitle}
+                    {compact ? ` (${pct}%)` : `（${pct}% · ${formatRelativeTime(s.last_modified_time)}）`}
                   </option>
                 );
               })}
@@ -225,14 +229,14 @@ export default function ContextMonitorCard({
 
           {/* Footer Compact Metrics */}
           <div className="ctx-footer-grid">
-            <div className="ctx-mini-stat">
+            <div className="ctx-mini-stat ctx-stat-compact">
               <span className="ctx-micro-label">触发压缩</span>
               <strong className={current.compactionCount > 0 ? 'ctx-compact-active' : ''}>
                 {current.compactionCount} 次
               </strong>
             </div>
 
-            <div className="ctx-mini-stat">
+            <div className="ctx-mini-stat ctx-stat-model">
               <span className="ctx-micro-label">当前端点与档位</span>
               <span className="ctx-model-inline" title={current.latestModel}>
                 <span
@@ -248,7 +252,7 @@ export default function ContextMonitorCard({
               </span>
             </div>
 
-            <div className="ctx-mini-stat" style={{ textAlign: 'right' }}>
+            <div className="ctx-mini-stat ctx-stat-cost">
               <span className="ctx-micro-label">本会话费用 / 步数</span>
               <strong className="mono" style={{ color: 'var(--cost)' }}>
                 {formatUsd(current.estimatedCostUsd)}

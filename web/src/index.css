@@ -258,12 +258,88 @@ input:focus-visible,
 .header-inner {
   max-width: 1360px;
   margin: 0 auto;
-  padding: 0 24px;
-  height: 58px;
+  padding: 10px 24px;
+  min-height: 58px;
+  height: auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 10px 16px;
+  flex-wrap: wrap;
+}
+
+.header-row-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.header-utility-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.header-range-group {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.live-dot-inline {
+  display: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
+  flex-shrink: 0;
+}
+
+.live-dot-inline.offline {
+  background: #ef4444;
+  box-shadow: none;
+}
+
+@media (min-width: 1120px) {
+  .header-inner {
+    flex-wrap: nowrap;
+  }
+  .header-row-top {
+    display: contents;
+  }
+  .brand-group {
+    order: 1;
+  }
+  .header-range-group {
+    order: 2;
+    margin-left: auto;
+  }
+  .header-utility-group {
+    order: 3;
+  }
+}
+
+@media (max-width: 1119px) {
+  .header-inner {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 10px 16px;
+    gap: 8px;
+  }
+  .header-row-top {
+    width: 100%;
+  }
+  .header-range-group {
+    width: 100%;
+  }
+  .segmented.header-range-seg {
+    width: fit-content;
+  }
 }
 
 .brand-group {
@@ -1359,6 +1435,8 @@ input:focus-visible,
   background: var(--live-bg);
   color: var(--live-text);
   border: 1px solid var(--live-border);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .child-count-tag {
@@ -1764,6 +1842,10 @@ input:focus-visible,
   font-size: 12.5px;
   color: var(--text-primary);
   min-width: 0;
+}
+
+.ctx-stat-cost {
+  text-align: right;
 }
 
 .ctx-compact-active {
@@ -2508,29 +2590,66 @@ input:focus-visible,
 }
 
 .app-shell.compact-mode .header-inner {
-  padding: 10px 12px;
+  padding: 9px 12px;
   gap: 8px;
-  flex-wrap: wrap;
+}
+
+.app-shell.compact-mode .segmented.header-range-seg {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.app-shell.compact-mode .segmented.header-range-seg .seg-btn {
+  width: 100%;
+  justify-content: center;
+  padding: 5px 4px;
+}
+
+.app-shell.compact-mode .brand-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+
+.app-shell.compact-mode .brand-home-btn {
+  gap: 8px;
 }
 
 .app-shell.compact-mode .brand-title {
-  font-size: 14px;
+  font-size: 13.5px;
 }
 
 .app-shell.compact-mode .brand-subtitle {
-  font-size: 11px;
+  display: none;
 }
 
-.app-shell.compact-mode .header-actions {
-  width: 100%;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 6px;
+.app-shell.compact-mode .live-pill {
+  display: none;
+}
+
+.app-shell.compact-mode .live-dot-inline {
+  display: inline-block;
+}
+
+.app-shell.compact-mode .hide-on-compact {
+  display: none;
+}
+
+.app-shell.compact-mode .header-utility-group {
+  gap: 5px;
+}
+
+.app-shell.compact-mode .header-utility-group .btn-ghost {
+  height: 28px;
+  width: 28px;
+  padding: 0;
+  border-radius: 7px;
 }
 
 .app-shell.compact-mode .app-main {
-  padding: 12px;
-  gap: 12px;
+  padding: 10px 12px 28px;
+  gap: 10px;
 }
 
 .app-shell.compact-mode .kpi-grid {
@@ -2540,10 +2659,56 @@ input:focus-visible,
 
 .app-shell.compact-mode .kpi-card {
   padding: 11px 12px;
+  min-height: 98px;
+  gap: 6px;
+}
+
+.app-shell.compact-mode .kpi-label {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.app-shell.compact-mode .kpi-icon {
+  display: none;
+}
+
+.app-shell.compact-mode .savings-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+.app-shell.compact-mode .kpi-value-row {
+  gap: 5px;
+  flex-wrap: wrap;
 }
 
 .app-shell.compact-mode .kpi-value {
   font-size: 20px;
+}
+
+.app-shell.compact-mode .kpi-unit {
+  font-size: 11px;
+}
+
+.app-shell.compact-mode .kpi-sub {
+  font-size: 11px;
+  gap: 4px 8px;
+  line-height: 1.4;
+}
+
+.app-shell.compact-mode .kpi-sep {
+  display: none;
+}
+
+.app-shell.compact-mode .kpi-inline-links {
+  gap: 5px;
+}
+
+.app-shell.compact-mode .kpi-link-btn {
+  font-size: 11px;
 }
 
 .app-shell.compact-mode .panel-card {
@@ -2556,18 +2721,80 @@ input:focus-visible,
   gap: 8px;
 }
 
+.app-shell.compact-mode .context-monitor-card .panel-header {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin-bottom: 10px !important;
+}
+
+.app-shell.compact-mode .context-monitor-card .panel-title-wrap {
+  min-width: 0;
+  gap: 6px;
+}
+
+.app-shell.compact-mode .context-monitor-card .panel-title {
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.app-shell.compact-mode .context-monitor-card .limit-pill {
+  height: 23px;
+  padding: 0 7px;
+  font-size: 10.5px;
+  flex-shrink: 0;
+}
+
 .app-shell.compact-mode .ctx-selector-row {
-  flex-direction: column;
-  align-items: stretch;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.app-shell.compact-mode .ctx-select {
+  height: 32px;
+  font-size: 12px;
+  padding: 0 9px;
 }
 
 .app-shell.compact-mode .ctx-open-btn {
-  justify-content: center;
+  height: 32px;
+  padding: 0 9px;
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+.app-shell.compact-mode .ctx-big-num {
+  font-size: 21px;
+}
+
+.app-shell.compact-mode .ctx-gauge-legend {
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 11px;
 }
 
 .app-shell.compact-mode .ctx-footer-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px 8px;
+  align-items: start;
+}
+
+.app-shell.compact-mode .ctx-stat-model {
+  grid-column: 1 / -1;
+  order: -1;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--border);
+}
+
+.app-shell.compact-mode .ctx-stat-compact {
+  text-align: left;
+}
+
+.app-shell.compact-mode .ctx-stat-cost {
+  text-align: right;
 }
 
 .app-shell.compact-mode .model-grid {
@@ -2589,10 +2816,6 @@ input:focus-visible,
 .app-shell.compact-mode .search-box {
   width: 100%;
   min-width: 0;
-}
-
-.app-shell.compact-mode .live-pill span:last-child {
-  display: none;
 }
 
 /* --- Guard Settings Drawer, Workspace Breakdown, Bloat Attribution & Jump Button --- */
