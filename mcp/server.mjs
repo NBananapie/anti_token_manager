@@ -35,6 +35,14 @@ const TOOLS = [
           type: 'string',
           description: '可选，按指定自然日查询，格式 YYYY-MM-DD（例如 2026-11-20）。'
         },
+        start_date: {
+          type: 'string',
+          description: '可选，自定义起始日期 YYYY-MM-DD（可单独传或配合 end_date 查询任意区间）。'
+        },
+        end_date: {
+          type: 'string',
+          description: '可选，自定义结束日期 YYYY-MM-DD。'
+        },
         workspace: {
           type: 'string',
           description: '可选，按项目路径或 file:// URI 过滤统计范围。'
@@ -221,8 +229,12 @@ function executeTool(name, args = {}) {
   if (name === 'token_get_overview') {
     const range = typeof args.range === 'string' && args.range ? args.range : '7d';
     const date = typeof args.date === 'string' && args.date.trim() ? args.date.trim() : null;
-    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      throw new Error('date 格式必须为 YYYY-MM-DD');
+    const startDate = typeof args.start_date === 'string' && args.start_date.trim() ? args.start_date.trim() : null;
+    const endDate = typeof args.end_date === 'string' && args.end_date.trim() ? args.end_date.trim() : null;
+    for (const [label, val] of [['date', date], ['start_date', startDate], ['end_date', endDate]]) {
+      if (val && !/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+        throw new Error(`${label} 格式必须为 YYYY-MM-DD`);
+      }
     }
     const workspace = typeof args.workspace === 'string' && args.workspace.trim()
       ? args.workspace.trim()
@@ -230,7 +242,7 @@ function executeTool(name, args = {}) {
     const focusId = typeof args.focus_conversation_id === 'string' && args.focus_conversation_id.trim()
       ? args.focus_conversation_id.trim()
       : null;
-    return getOverviewData({ range, date, focusConversationId: focusId, workspace });
+    return getOverviewData({ range, date, startDate, endDate, focusConversationId: focusId, workspace });
   }
 
   if (name === 'token_get_session_audit') {

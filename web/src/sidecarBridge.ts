@@ -104,6 +104,47 @@ export function createApiEventSource(apiPath: string): EventSource {
   return new EventSource(normalizeApiPath(apiPath));
 }
 
+export function isPaneVisibleNow(): boolean {
+  if (typeof document === 'undefined') return true;
+  if (document.visibilityState !== 'visible') return false;
+  const docEl = document.documentElement;
+  if (!docEl) return true;
+  return docEl.clientWidth > 0 && docEl.clientHeight > 0;
+}
+
+export function observePaneVisibility(onChange: (visible: boolean) => void): () => void {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return () => {};
+  }
+  let lastVisible = isPaneVisibleNow();
+  const check = () => {
+    const next = isPaneVisibleNow();
+    if (next !== lastVisible) {
+      lastVisible = next;
+      onChange(next);
+    }
+  };
+
+  document.addEventListener('visibilitychange', check);
+  window.addEventListener('pageshow', check);
+  window.addEventListener('pagehide', check);
+  window.addEventListener('resize', check);
+
+  let ro: ResizeObserver | null = null;
+  if (typeof ResizeObserver === 'function' && document.documentElement) {
+    ro = new ResizeObserver(check);
+    ro.observe(document.documentElement);
+  }
+
+  return () => {
+    document.removeEventListener('visibilitychange', check);
+    window.removeEventListener('pageshow', check);
+    window.removeEventListener('pagehide', check);
+    window.removeEventListener('resize', check);
+    if (ro) ro.disconnect();
+  };
+}
+
 function detectHostThemeFromRoot(): 'dark' | 'light' | null {
   try {
     const rootStyle = getComputedStyle(document.documentElement);

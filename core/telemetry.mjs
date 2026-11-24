@@ -253,9 +253,10 @@ export function computeTurnCostDetails(modelName, inputTokens, cacheReadTokens, 
   return { costUsd, cacheSavingsUsd };
 }
 
-// --- Read-Only Language Server Context Limit Detection (Cached by mtime) ---
+// --- Read-Only Language Server Context Limit Detection (Cached by mtime + disk snapshot) ---
 let cachedContextConfig = null;
 let cachedBinaryMtime = 0;
+let cachedBinarySize = 0;
 
 export function findLanguageServerBinary() {
   if (process.platform === 'win32') {
@@ -297,7 +298,26 @@ export function getContextLimitConfig() {
     const binPath = findLanguageServerBinary();
     if (!binPath) return defaultCfg;
     const stat = fs.statSync(binPath);
-    if (cachedContextConfig && cachedBinaryMtime === stat.mtimeMs) {
+    const mtimeRounded = Math.round(stat.mtimeMs);
+    if (
+      cachedContextConfig &&
+      cachedBinaryMtime === stat.mtimeMs &&
+      cachedBinarySize === stat.size
+    ) {
+      return cachedContextConfig;
+    }
+
+    const diskCached = loadJsonState('context-limit-cache.json', null);
+    if (
+      diskCached &&
+      diskCached.detected === true &&
+      diskCached.binaryPath === binPath &&
+      diskCached.binaryMtimeMs === mtimeRounded &&
+      diskCached.binarySize === stat.size
+    ) {
+      cachedContextConfig = diskCached;
+      cachedBinaryMtime = stat.mtimeMs;
+      cachedBinarySize = stat.size;
       return cachedContextConfig;
     }
 
@@ -340,9 +360,12 @@ export function getContextLimitConfig() {
       cloudOverrideBypassed,
       label: formatLimitLabel(effectiveLimit),
       binaryPath: binPath,
-      binaryMtimeMs: Math.round(stat.mtimeMs)
+      binaryMtimeMs: mtimeRounded,
+      binarySize: stat.size
     };
     cachedBinaryMtime = stat.mtimeMs;
+    cachedBinarySize = stat.size;
+    saveJsonState('context-limit-cache.json', cachedContextConfig);
     return cachedContextConfig;
   } catch {
     return defaultCfg;
@@ -358,31 +381,65 @@ export function toLocalDateKey(ms) {
   return `${y}-${m}-${day}`;
 }
 
-export function getRangeBounds(rangeStr, exactDateStr) {
+const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseLocalDateStartMs(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+}
+
+function parseLocalDateEndMs(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(y, m - 1, d, 23, 59, 59, 999).getTime();
+}
+
+export function getRangeBounds(rangeStr, exactDateStr, startDateStr = null, endDateStr = null) {
   const now = new Date();
-  if (exactDateStr && /^\d{4}-\d{2}-\d{2}$/.test(exactDateStr)) {
-    const [y, m, d] = exactDateStr.split('-').map(Number);
-    const start = new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
-    const end = new Date(y, m - 1, d, 23, 59, 59, 999).getTime();
-    return { startMs: start, endMs: end, range: 'date', date: exactDateStr };
+  if (exactDateStr && DATE_KEY_RE.test(exactDateStr)) {
+    return {
+      startMs: parseLocalDateStartMs(exactDateStr),
+      endMs: parseLocalDateEndMs(exactDateStr),
+      range: 'date',
+      date: exactDateStr,
+      startDate: exactDateStr,
+      endDate: exactDateStr
+    };
+  }
+
+  const validStart = startDateStr && DATE_KEY_RE.test(startDateStr) ? startDateStr : null;
+  const validEnd = endDateStr && DATE_KEY_RE.test(endDateStr) ? endDateStr : null;
+  if (validStart || validEnd) {
+    let sDate = validStart || validEnd;
+    let eDate = validEnd || toLocalDateKey(now.getTime());
+    if (sDate > eDate) {
+      [sDate, eDate] = [eDate, sDate];
+    }
+    return {
+      startMs: parseLocalDateStartMs(sDate),
+      endMs: parseLocalDateEndMs(eDate),
+      range: 'custom',
+      date: sDate === eDate ? sDate : null,
+      startDate: sDate,
+      endDate: eDate
+    };
   }
 
   const r = (rangeStr || '7d').toLowerCase();
   if (r === 'all') {
-    return { startMs: null, endMs: null, range: 'all', date: null };
+    return { startMs: null, endMs: null, range: 'all', date: null, startDate: null, endDate: null };
   }
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
   if (r === 'today') {
-    return { startMs: todayStart.getTime(), endMs: null, range: 'today', date: null };
+    return { startMs: todayStart.getTime(), endMs: null, range: 'today', date: null, startDate: null, endDate: null };
   }
   if (r === '30d') {
     const start = new Date(todayStart);
     start.setDate(start.getDate() - 29);
-    return { startMs: start.getTime(), endMs: null, range: '30d', date: null };
+    return { startMs: start.getTime(), endMs: null, range: '30d', date: null, startDate: null, endDate: null };
   }
   const start = new Date(todayStart);
   start.setDate(start.getDate() - 6);
-  return { startMs: start.getTime(), endMs: null, range: '7d', date: null };
+  return { startMs: start.getTime(), endMs: null, range: '7d', date: null, startDate: null, endDate: null };
 }
 
 // --- Protobuf Decoders for gen_metadata and steps ---
@@ -712,11 +769,88 @@ function parseGenMetadataBlob(buf) {
   }
 }
 
-// In-memory cache for parsed sessions and transcript tool traces
+// In-memory cache for parsed sessions, light rollups, session info, window stats, and transcript tool traces
+const SESSION_CACHE_MAX = 80;
+const SESSION_INFO_CACHE_MAX = 1500;
+const WINDOW_STATS_CACHE_MAX = 12;
+const ROLLUP_CACHE_FILENAME = 'session-rollup-cache-v1.json';
+const ROLLUP_SCHEMA_VERSION = 1;
+
 const sessionCache = new Map();
+const sessionInfoCache = new Map();
 const transcriptTraceCache = new Map();
+const rollupCache = new Map();
+const windowStatsCache = new Map();
+
+let rollupDiskLoaded = false;
+let rollupCacheDirty = false;
+let rollupPersistTimer = null;
+
 let masterIndexCache = null;
-let lastMasterCacheTime = 0;
+let masterVersion = 0;
+let masterNeedsFullRebuild = true;
+let summariesDirty = true;
+const dirtySessionIds = new Set();
+let cachedSummaryMap = new Map();
+
+function setSessionCache(conversationId, entry) {
+  if (sessionCache.has(conversationId)) {
+    sessionCache.delete(conversationId);
+  } else if (sessionCache.size >= SESSION_CACHE_MAX) {
+    const oldestKey = sessionCache.keys().next().value;
+    if (oldestKey !== undefined) sessionCache.delete(oldestKey);
+  }
+  sessionCache.set(conversationId, entry);
+}
+
+function ensureRollupDiskCacheLoaded() {
+  if (rollupDiskLoaded) return;
+  rollupDiskLoaded = true;
+  const saved = loadJsonState(ROLLUP_CACHE_FILENAME, null);
+  if (
+    saved &&
+    saved.schemaVersion === ROLLUP_SCHEMA_VERSION &&
+    saved.entries &&
+    typeof saved.entries === 'object'
+  ) {
+    for (const [id, entry] of Object.entries(saved.entries)) {
+      if (entry && entry.cacheKey && entry.rollup) {
+        rollupCache.set(id, entry);
+      }
+    }
+  }
+}
+
+function persistRollupCacheNow() {
+  if (!rollupCacheDirty) return;
+  rollupCacheDirty = false;
+  const entries = {};
+  for (const [id, entry] of rollupCache.entries()) {
+    entries[id] = entry;
+  }
+  saveJsonState(ROLLUP_CACHE_FILENAME, {
+    schemaVersion: ROLLUP_SCHEMA_VERSION,
+    savedAtMs: Date.now(),
+    entries
+  });
+}
+
+function scheduleRollupPersist() {
+  if (!rollupCacheDirty || rollupPersistTimer) return;
+  rollupPersistTimer = setTimeout(() => {
+    rollupPersistTimer = null;
+    persistRollupCacheNow();
+  }, 2000);
+  if (typeof rollupPersistTimer.unref === 'function') {
+    rollupPersistTimer.unref();
+  }
+}
+
+if (typeof process !== 'undefined' && typeof process.once === 'function') {
+  process.once('beforeExit', () => {
+    persistRollupCacheNow();
+  });
+}
 
 const SENSITIVE_CMD_RE = /(api[_-]?key|token|secret|password|authorization|bearer)/i;
 
@@ -884,29 +1018,59 @@ function parseTranscriptStepAttribution(conversationId) {
 }
 
 export function invalidateMasterIndexCache() {
+  masterNeedsFullRebuild = true;
+  summariesDirty = true;
   masterIndexCache = null;
+  windowStatsCache.clear();
 }
 
-export function getSessionModelStats(conversationId) {
+export function markSessionDirty(conversationId) {
+  if (!conversationId || /[\\/:\0]/.test(conversationId)) return;
+  dirtySessionIds.add(conversationId);
+  sessionInfoCache.delete(conversationId);
+  windowStatsCache.clear();
+}
+
+export function markSummariesDirty() {
+  summariesDirty = true;
+  windowStatsCache.clear();
+}
+
+function getDbCacheKey(conversationId) {
   if (!conversationId || /[\\/:\0]/.test(conversationId)) return null;
   const dbFile = path.join(CONVERSATIONS_DIR, `${conversationId}.db`);
-  if (!fs.existsSync(dbFile)) return null;
+  let stat;
+  try {
+    stat = fs.statSync(dbFile);
+  } catch {
+    return null;
+  }
+  const walFile = `${dbFile}-wal`;
+  let walSig = '0';
+  let effectiveMtimeMs = stat.mtimeMs;
+  try {
+    const wStat = fs.statSync(walFile);
+    walSig = `${wStat.mtimeMs}:${wStat.size}`;
+    if (wStat.mtimeMs > effectiveMtimeMs) effectiveMtimeMs = wStat.mtimeMs;
+  } catch {}
+  return {
+    dbFile,
+    stat,
+    effectiveMtimeMs,
+    cacheKey: `${stat.mtimeMs}:${stat.size}:${walSig}`
+  };
+}
+
+export function getSessionModelStats(conversationId, cacheFullDetail = true) {
+  const sig = getDbCacheKey(conversationId);
+  if (!sig) return null;
 
   try {
-    const stat = fs.statSync(dbFile);
-    const walFile = `${dbFile}-wal`;
-    let walSig = '0';
-    let effectiveMtimeMs = stat.mtimeMs;
-    if (fs.existsSync(walFile)) {
-      try {
-        const wStat = fs.statSync(walFile);
-        walSig = `${wStat.mtimeMs}:${wStat.size}`;
-        if (wStat.mtimeMs > effectiveMtimeMs) effectiveMtimeMs = wStat.mtimeMs;
-      } catch {}
-    }
-    const cacheKey = `${stat.mtimeMs}:${stat.size}:${walSig}`;
+    const { dbFile, stat, effectiveMtimeMs, cacheKey } = sig;
     const cached = sessionCache.get(conversationId);
     if (cached && cached.cacheKey === cacheKey) {
+      sessionCache.delete(conversationId);
+      sessionCache.set(conversationId, cached);
       return cached.data;
     }
 
@@ -1214,17 +1378,228 @@ export function getSessionModelStats(conversationId) {
       generations
     };
 
-    sessionCache.set(conversationId, {
-      cacheKey,
-      mtime: effectiveMtimeMs,
-      data: result
-    });
+    if (cacheFullDetail) {
+      setSessionCache(conversationId, {
+        cacheKey,
+        mtime: effectiveMtimeMs,
+        data: result
+      });
+    }
 
     return result;
   } catch (err) {
     console.error(`Error reading session ${conversationId}:`, err.message);
     return null;
   }
+}
+
+function buildSessionRollupFromDetail(detail) {
+  if (!detail) return null;
+  const bucketMap = new Map();
+  const cpDayMap = new Map();
+  const hourlyMap = new Map();
+
+  for (const g of detail.generations || []) {
+    const ts = g.timestampMs || detail.lastTimestampMs || 0;
+    const dKey = ts ? toLocalDateKey(ts) : '__nodate__';
+    const model = g.model || 'unknown';
+    const bKey = `${dKey}\0${model}`;
+    let b = bucketMap.get(bKey);
+    if (!b) {
+      b = {
+        date: dKey,
+        model,
+        calls: 0,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        outputTokens: 0,
+        thinkingTokens: 0,
+        responseTokens: 0,
+        costUsd: 0,
+        cacheSavingsUsd: 0,
+        firstTs: ts || null,
+        lastTs: ts || 0,
+        ttftSum: 0,
+        ttftCount: 0,
+        streamTokSum: 0,
+        streamSecSum: 0,
+        e2eTokSum: 0,
+        e2eSecSum: 0,
+        thinkTokSum: 0,
+        outTokSum: 0
+      };
+      bucketMap.set(bKey, b);
+    }
+    b.calls += 1;
+    b.inputTokens += g.inputTokens || 0;
+    b.cacheReadTokens += g.cacheReadTokens || 0;
+    b.outputTokens += g.outputTokens || 0;
+    b.thinkingTokens += g.thinkingTokens || 0;
+    b.responseTokens += g.responseTokens || 0;
+    b.costUsd += g.costUsd || 0;
+    b.cacheSavingsUsd += g.cacheSavingsUsd || 0;
+    if (ts) {
+      if (b.firstTs === null || ts < b.firstTs) b.firstTs = ts;
+      if (ts > b.lastTs) b.lastTs = ts;
+      const dObj = new Date(ts);
+      const dow = (dObj.getDay() + 6) % 7;
+      const hr = dObj.getHours();
+      const hKey = `${dow}:${hr}`;
+      let hc = hourlyMap.get(hKey);
+      if (!hc) {
+        hc = [dow, hr, 0, 0, 0];
+        hourlyMap.set(hKey, hc);
+      }
+      hc[2] += (g.inputTokens || 0) + (g.cacheReadTokens || 0) + (g.outputTokens || 0);
+      hc[3] += g.costUsd || 0;
+      hc[4] += 1;
+    }
+
+    b.thinkTokSum += g.thinkingTokens || 0;
+    b.outTokSum += g.outputTokens || 0;
+    if (g.totalSec !== null && g.totalSec > 0) {
+      if (g.ttftSec !== null) {
+        b.ttftSum += g.ttftSec;
+        b.ttftCount += 1;
+      }
+      if (g.outputTokens > 0) {
+        b.e2eTokSum += g.outputTokens;
+        b.e2eSecSum += g.totalSec;
+      }
+      if (g.streamSec !== null && g.streamSec >= 0.5 && g.responseTokens > 0) {
+        b.streamTokSum += g.responseTokens;
+        b.streamSecSum += g.streamSec;
+      }
+    }
+  }
+
+  for (const cp of detail.checkpoints || []) {
+    const ts = cp.timestampMs || 0;
+    const dKey = ts ? toLocalDateKey(ts) : '__nodate__';
+    let cpDay = cpDayMap.get(dKey);
+    if (!cpDay) {
+      cpDay = {
+        date: dKey,
+        count: 0,
+        hasTimestampCount: 0,
+        billedMap: new Map()
+      };
+      cpDayMap.set(dKey, cpDay);
+    }
+    cpDay.count += 1;
+    if (cp.timestampMs) cpDay.hasTimestampCount += 1;
+
+    const cpTok = (cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0);
+    if (cpTok > 0) {
+      const cpModel = cp.model || detail.latestModel || 'unknown';
+      let bm = cpDay.billedMap.get(cpModel);
+      if (!bm) {
+        bm = {
+          model: cpModel,
+          calls: 0,
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          outputTokens: 0,
+          thinkingTokens: 0,
+          responseTokens: 0,
+          costUsd: 0,
+          cacheSavingsUsd: 0,
+          firstTs: ts || null,
+          lastTs: ts || 0
+        };
+        cpDay.billedMap.set(cpModel, bm);
+      }
+      bm.calls += 1;
+      bm.inputTokens += cp.inputTokens || 0;
+      bm.cacheReadTokens += cp.cacheReadTokens || 0;
+      bm.outputTokens += cp.outputTokens || 0;
+      bm.thinkingTokens += cp.thinkingTokens || 0;
+      bm.responseTokens += cp.responseTokens || 0;
+      bm.costUsd += cp.costUsd || 0;
+      bm.cacheSavingsUsd += cp.cacheSavingsUsd || 0;
+      if (ts) {
+        if (bm.firstTs === null || ts < bm.firstTs) bm.firstTs = ts;
+        if (ts > bm.lastTs) bm.lastTs = ts;
+        const dObj = new Date(ts);
+        const dow = (dObj.getDay() + 6) % 7;
+        const hr = dObj.getHours();
+        const hKey = `${dow}:${hr}`;
+        let hc = hourlyMap.get(hKey);
+        if (!hc) {
+          hc = [dow, hr, 0, 0, 0];
+          hourlyMap.set(hKey, hc);
+        }
+        hc[2] += cpTok;
+        hc[3] += cp.costUsd || 0;
+        hc[4] += 1;
+      }
+    }
+  }
+
+  const dailyCheckpoints = Array.from(cpDayMap.values()).map(cd => ({
+    date: cd.date,
+    count: cd.count,
+    hasTimestampCount: cd.hasTimestampCount,
+    billed: Array.from(cd.billedMap.values())
+  }));
+
+  const gens = detail.generations || [];
+  const lastTurn = gens.length > 0 ? gens[gens.length - 1] : null;
+
+  return {
+    conversationId: detail.conversationId,
+    mtimeMs: detail.mtimeMs,
+    generationCount: gens.length,
+    totalCalls: detail.totalCalls,
+    latestModel: detail.latestModel,
+    modelsUsed: Object.keys(detail.modelCounts || {}),
+    modelCounts: detail.modelCounts || {},
+    totalInputTokens: detail.totalInputTokens,
+    totalCacheReadTokens: detail.totalCacheReadTokens,
+    totalOutputTokens: detail.totalOutputTokens,
+    totalThinkingTokens: detail.totalThinkingTokens,
+    totalResponseTokens: detail.totalResponseTokens,
+    currentContextTokens: detail.currentContextTokens,
+    peakContextTokens: detail.peakContextTokens,
+    compactionCount: detail.compactionCount,
+    estimatedCostUsd: detail.estimatedCostUsd,
+    cacheSavingsUsd: detail.cacheSavingsUsd,
+    firstTimestampMs: detail.firstTimestampMs,
+    lastTimestampMs: detail.lastTimestampMs,
+    avgTtftSec: detail.avgTtftSec,
+    streamTps: detail.streamTps,
+    e2eTps: detail.e2eTps,
+    thinkingSharePct: detail.thinkingSharePct,
+    lastInputTokens: lastTurn?.inputTokens || 0,
+    lastCacheReadTokens: lastTurn?.cacheReadTokens || 0,
+    dailyModelBuckets: Array.from(bucketMap.values()),
+    dailyCheckpoints,
+    hourlyCells: Array.from(hourlyMap.values())
+  };
+}
+
+function getSessionRollup(conversationId, metrics = null) {
+  ensureRollupDiskCacheLoaded();
+  const sig = getDbCacheKey(conversationId);
+  if (!sig) return null;
+
+  const cachedRollup = rollupCache.get(conversationId);
+  if (cachedRollup && cachedRollup.cacheKey === sig.cacheKey) {
+    return cachedRollup.rollup;
+  }
+
+  const detail = getSessionModelStats(conversationId, false);
+  if (!detail) return null;
+
+  const rollup = buildSessionRollupFromDetail(detail);
+  rollupCache.set(conversationId, {
+    cacheKey: sig.cacheKey,
+    mtime: sig.effectiveMtimeMs,
+    rollup
+  });
+  rollupCacheDirty = true;
+  if (metrics) metrics.newlyParsed += 1;
+  return rollup;
 }
 
 /**
@@ -1316,6 +1691,16 @@ export function loadAllSummaries() {
   }
 }
 
+function setSessionInfoCache(id, entry) {
+  if (sessionInfoCache.has(id)) {
+    sessionInfoCache.delete(id);
+  } else if (sessionInfoCache.size >= SESSION_INFO_CACHE_MAX) {
+    const oldest = sessionInfoCache.keys().next().value;
+    if (oldest !== undefined) sessionInfoCache.delete(oldest);
+  }
+  sessionInfoCache.set(id, entry);
+}
+
 export function resolveSessionInfo(id, summary) {
   const title = summary?.title?.trim() || '';
   const agentName = summary?.agent_name || '';
@@ -1331,18 +1716,38 @@ export function resolveSessionInfo(id, summary) {
     };
   }
 
+  const summarySig = `${agentName}|${parentId}|${summary?.preview || ''}`;
+  const cached = sessionInfoCache.get(id);
+  if (
+    cached &&
+    cached.summarySig === summarySig &&
+    (!cached.isFallback || Date.now() - cached.checkedAt < 30000)
+  ) {
+    return cached.value;
+  }
+
+  const commit = (value, isFallback = false) => {
+    setSessionInfoCache(id, {
+      summarySig,
+      isFallback,
+      checkedAt: Date.now(),
+      value
+    });
+    return value;
+  };
+
   const pbtxtFile = path.join(ANNOTATIONS_DIR, `${id}.pbtxt`);
   if (fs.existsSync(pbtxtFile)) {
     try {
       const content = fs.readFileSync(pbtxtFile, 'utf-8');
       const m = content.match(/title:\s*"([^"]+)"/);
       if (m && m[1].trim()) {
-        return {
+        return commit({
           title: m[1].trim(),
           sessionType: isSubagent ? 'subagent' : 'main',
           agentName,
           parentId
-        };
+        });
       }
     } catch {}
   }
@@ -1361,12 +1766,12 @@ export function resolveSessionInfo(id, summary) {
         if (mContent && mContent[1].trim()) {
           let p = mContent[1].trim();
           p = p.replace(/^[#\*\s]+/, '').replace(/\\n/g, ' ').replace(/\s+/g, ' ');
-          return {
+          return commit({
             title: `[子任务 · ${agentName}] ${p.slice(0, 55)}`,
             sessionType: 'subagent',
             agentName,
             parentId
-          };
+          });
         }
       }
 
@@ -1386,12 +1791,12 @@ export function resolveSessionInfo(id, summary) {
             prompt = prompt.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
             if (prompt) {
               const prefix = isSubagent ? `[子任务 · ${agentName}] ` : '';
-              return {
+              return commit({
                 title: `${prefix}${prompt.slice(0, 55)}${prompt.length > 55 ? '...' : ''}`,
                 sessionType: isSubagent ? 'subagent' : 'side_query',
                 agentName,
                 parentId
-              };
+              });
             }
           }
         } catch {}
@@ -1402,21 +1807,21 @@ export function resolveSessionInfo(id, summary) {
   if (summary?.preview) {
     const cleanPrev = summary.preview.replace(/[\r\n]+/g, ' ').trim();
     if (cleanPrev) {
-      return {
+      return commit({
         title: `${isSubagent ? `[子任务 · ${agentName}] ` : ''}${cleanPrev.slice(0, 50)}`,
         sessionType: isSubagent ? 'subagent' : 'side_query',
         agentName,
         parentId
-      };
+      });
     }
   }
 
-  return {
+  return commit({
     title: isSubagent ? `[子任务 · ${agentName}]` : `后台/侧栏临时对话 (${id.slice(0, 8)})`,
     sessionType: isSubagent ? 'subagent' : 'side_query',
     agentName,
     parentId
-  };
+  }, true);
 }
 
 export function normalizeWorkspaceKey(raw) {
@@ -1484,10 +1889,239 @@ export function parseWorkspaceUris(raw) {
   };
 }
 
+function buildMasterRecord(id, summary, rollup) {
+  const resolved = resolveSessionInfo(id, summary);
+  const baseWorkspaces = parseWorkspaceUris(summary?.workspace_uris);
+  const lastModifiedIso = summary?.last_modified_time || (rollup ? new Date(rollup.lastTimestampMs).toISOString() : '');
+  const lastTs = rollup?.lastTimestampMs || (lastModifiedIso ? new Date(lastModifiedIso).getTime() : 0);
+  const firstTs = rollup?.firstTimestampMs || lastTs;
+
+  return {
+    id,
+    summary,
+    resolved,
+    baseWorkspaces,
+    workspaces: baseWorkspaces,
+    rollup,
+    lastModifiedIso,
+    firstTs,
+    lastTs
+  };
+}
+
+function finalizeMasterIndex(recordMap) {
+  const childrenByParent = new Map();
+  for (const rec of recordMap.values()) {
+    rec.workspaces = rec.baseWorkspaces;
+    if (rec.resolved.parentId) {
+      if (!childrenByParent.has(rec.resolved.parentId)) childrenByParent.set(rec.resolved.parentId, []);
+      childrenByParent.get(rec.resolved.parentId).push(rec.id);
+    }
+  }
+
+  // Inherit parent workspace for derived subagents when summary has no workspace_uris
+  for (const rec of recordMap.values()) {
+    if (rec.workspaces.keys.length === 0 && rec.resolved.parentId) {
+      let curId = rec.resolved.parentId;
+      for (let depth = 0; depth < 5 && curId; depth++) {
+        const parent = recordMap.get(curId);
+        if (!parent) break;
+        if (parent.baseWorkspaces.keys.length > 0) {
+          rec.workspaces = parent.baseWorkspaces;
+          break;
+        }
+        curId = parent.resolved.parentId;
+      }
+    }
+  }
+
+  const records = Array.from(recordMap.values()).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+  const dailyMap = new Map();
+  const hourlyMatrix = Array.from({ length: 7 }, () =>
+    Array.from({ length: 24 }, () => ({ tokens: 0, costUsd: 0, calls: 0 }))
+  );
+
+  let minTs = null;
+  let maxTs = null;
+
+  const ensureDailyBucket = (dKey) => {
+    let bucket = dailyMap.get(dKey);
+    if (!bucket) {
+      bucket = {
+        date: dKey,
+        tokens: 0,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        calls: 0,
+        sessions: 0,
+        compactions: 0
+      };
+      dailyMap.set(dKey, bucket);
+    }
+    return bucket;
+  };
+
+  for (const rec of records) {
+    const r = rec.rollup;
+    if (!r || r.generationCount === 0) continue;
+
+    const seenDatesForSession = new Set();
+    for (const b of r.dailyModelBuckets || []) {
+      if (b.firstTs && (minTs === null || b.firstTs < minTs)) minTs = b.firstTs;
+      if (b.lastTs && (maxTs === null || b.lastTs > maxTs)) maxTs = b.lastTs;
+      if (!b.date || b.date === '__nodate__') continue;
+
+      seenDatesForSession.add(b.date);
+      const bucket = ensureDailyBucket(b.date);
+      const tTok = b.inputTokens + b.cacheReadTokens + b.outputTokens;
+      bucket.tokens += tTok;
+      bucket.inputTokens += b.inputTokens;
+      bucket.cacheReadTokens += b.cacheReadTokens;
+      bucket.outputTokens += b.outputTokens;
+      bucket.costUsd += b.costUsd;
+      bucket.calls += b.calls;
+    }
+
+    for (const dk of seenDatesForSession) {
+      const b = dailyMap.get(dk);
+      if (b) b.sessions += 1;
+    }
+
+    for (const cpDay of r.dailyCheckpoints || []) {
+      if (!cpDay.date || cpDay.date === '__nodate__' || cpDay.hasTimestampCount <= 0) continue;
+      const b = ensureDailyBucket(cpDay.date);
+      b.compactions += cpDay.hasTimestampCount;
+      for (const bc of cpDay.billed || []) {
+        const cpTok = (bc.inputTokens || 0) + (bc.cacheReadTokens || 0) + (bc.outputTokens || 0);
+        if (cpTok > 0) {
+          b.tokens += cpTok;
+          b.inputTokens += bc.inputTokens || 0;
+          b.cacheReadTokens += bc.cacheReadTokens || 0;
+          b.outputTokens += bc.outputTokens || 0;
+          b.costUsd += bc.costUsd || 0;
+          b.calls += bc.calls || 0;
+        }
+      }
+    }
+
+    for (const cell of r.hourlyCells || []) {
+      const [dow, hr, tokens, costUsd, calls] = cell;
+      if (hourlyMatrix[dow]?.[hr]) {
+        hourlyMatrix[dow][hr].tokens += tokens;
+        hourlyMatrix[dow][hr].costUsd += costUsd;
+        hourlyMatrix[dow][hr].calls += calls;
+      }
+    }
+  }
+
+  const dailyList = Array.from(dailyMap.values())
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map(b => ({ ...b, costUsd: Number(b.costUsd.toFixed(2)) }));
+
+  const roundedHourly = hourlyMatrix.map(row =>
+    row.map(cell => ({
+      tokens: cell.tokens,
+      costUsd: Number(cell.costUsd.toFixed(2)),
+      calls: cell.calls
+    }))
+  );
+
+  masterVersion += 1;
+  windowStatsCache.clear();
+  masterIndexCache = {
+    version: masterVersion,
+    records,
+    recordMap,
+    childrenByParent,
+    heatmap: {
+      daily: dailyList,
+      hourlyMatrix: roundedHourly,
+      minDate: dailyList.length ? dailyList[0].date : null,
+      maxDate: dailyList.length ? dailyList[dailyList.length - 1].date : null
+    },
+    globalMinTs: minTs,
+    globalMaxTs: maxTs,
+    updatedAt: new Date().toISOString()
+  };
+  return masterIndexCache;
+}
+
+function summaryChanged(prev, next) {
+  if (!prev && !next) return false;
+  if (!prev || !next) return true;
+  return (
+    prev.last_modified_time !== next.last_modified_time ||
+    prev.title !== next.title ||
+    prev.workspace_uris !== next.workspace_uris ||
+    prev.agent_name !== next.agent_name ||
+    prev.parent_conversation_id !== next.parent_conversation_id ||
+    prev.preview !== next.preview ||
+    prev.step_count !== next.step_count
+  );
+}
+
 export function getMasterIndex() {
-  const now = Date.now();
-  if (masterIndexCache && now - lastMasterCacheTime < 3000) {
+  if (masterIndexCache && !masterNeedsFullRebuild && !summariesDirty && dirtySessionIds.size === 0) {
     return masterIndexCache;
+  }
+
+  const metrics = { newlyParsed: 0 };
+
+  if (masterIndexCache && !masterNeedsFullRebuild) {
+    const recordMap = masterIndexCache.recordMap;
+
+    if (summariesDirty) {
+      const summaries = loadAllSummaries();
+      const nextSummaryMap = new Map();
+      for (const s of summaries) nextSummaryMap.set(s.conversation_id, s);
+
+      let dbFiles = [];
+      try {
+        dbFiles = fs.readdirSync(CONVERSATIONS_DIR)
+          .filter(f => f.endsWith('.db'))
+          .map(f => f.replace('.db', ''));
+      } catch {}
+
+      const allIdSet = new Set([...nextSummaryMap.keys(), ...dbFiles]);
+      for (const existingId of Array.from(recordMap.keys())) {
+        if (!allIdSet.has(existingId)) {
+          recordMap.delete(existingId);
+          if (rollupCache.delete(existingId)) rollupCacheDirty = true;
+        }
+      }
+
+      for (const id of allIdSet) {
+        const nextSum = nextSummaryMap.get(id);
+        const existingRec = recordMap.get(id);
+        if (!existingRec) {
+          dirtySessionIds.add(id);
+        } else if (summaryChanged(existingRec.summary, nextSum) && !dirtySessionIds.has(id)) {
+          recordMap.set(id, buildMasterRecord(id, nextSum, existingRec.rollup));
+        }
+      }
+
+      cachedSummaryMap = nextSummaryMap;
+      summariesDirty = false;
+    }
+
+    for (const id of dirtySessionIds) {
+      const summary = cachedSummaryMap.get(id);
+      const rollup = getSessionRollup(id, metrics);
+      if (!summary && !rollup) {
+        recordMap.delete(id);
+        if (rollupCache.delete(id)) rollupCacheDirty = true;
+      } else {
+        recordMap.set(id, buildMasterRecord(id, summary, rollup));
+      }
+    }
+    dirtySessionIds.clear();
+
+    if (rollupCacheDirty) {
+      scheduleRollupPersist();
+    }
+    return finalizeMasterIndex(recordMap);
   }
 
   const summaries = loadAllSummaries();
@@ -1502,186 +2136,54 @@ export function getMasterIndex() {
   } catch {}
 
   const allIds = Array.from(new Set([...summaryMap.keys(), ...dbFiles]));
+  const allIdSet = new Set(allIds);
 
-  const records = [];
-  const childrenByParent = new Map();
-  const dailyMap = new Map();
-  const hourlyMatrix = Array.from({ length: 7 }, () =>
-    Array.from({ length: 24 }, () => ({ tokens: 0, costUsd: 0, calls: 0 }))
-  );
+  ensureRollupDiskCacheLoaded();
+  for (const cachedId of Array.from(rollupCache.keys())) {
+    if (!allIdSet.has(cachedId)) {
+      rollupCache.delete(cachedId);
+      rollupCacheDirty = true;
+    }
+  }
 
-  let minTs = null;
-  let maxTs = null;
-
+  const recordMap = new Map();
   for (const id of allIds) {
-    const sDetail = getSessionModelStats(id);
+    const rollup = getSessionRollup(id, metrics);
     const summary = summaryMap.get(id);
-    const resolved = resolveSessionInfo(id, summary);
-
-    const lastModifiedIso = summary?.last_modified_time || (sDetail ? new Date(sDetail.lastTimestampMs).toISOString() : '');
-    const lastTs = sDetail?.lastTimestampMs || (lastModifiedIso ? new Date(lastModifiedIso).getTime() : 0);
-    const firstTs = sDetail?.firstTimestampMs || lastTs;
-
-    if (resolved.parentId) {
-      if (!childrenByParent.has(resolved.parentId)) childrenByParent.set(resolved.parentId, []);
-      childrenByParent.get(resolved.parentId).push(id);
-    }
-
-    if (sDetail && sDetail.generations.length > 0) {
-      const seenDatesForSession = new Set();
-      for (const g of sDetail.generations) {
-        const ts = g.timestampMs || lastTs;
-        if (ts) {
-          if (minTs === null || ts < minTs) minTs = ts;
-          if (maxTs === null || ts > maxTs) maxTs = ts;
-          const dKey = toLocalDateKey(ts);
-          seenDatesForSession.add(dKey);
-
-          let bucket = dailyMap.get(dKey);
-          if (!bucket) {
-            bucket = {
-              date: dKey,
-              tokens: 0,
-              inputTokens: 0,
-              cacheReadTokens: 0,
-              outputTokens: 0,
-              costUsd: 0,
-              calls: 0,
-              sessions: 0,
-              compactions: 0
-            };
-            dailyMap.set(dKey, bucket);
-          }
-          const tTok = g.inputTokens + g.cacheReadTokens + g.outputTokens;
-          bucket.tokens += tTok;
-          bucket.inputTokens += g.inputTokens;
-          bucket.cacheReadTokens += g.cacheReadTokens;
-          bucket.outputTokens += g.outputTokens;
-          bucket.costUsd += g.costUsd;
-          bucket.calls += 1;
-
-          const dObj = new Date(ts);
-          const dow = (dObj.getDay() + 6) % 7;
-          const hr = dObj.getHours();
-          hourlyMatrix[dow][hr].tokens += tTok;
-          hourlyMatrix[dow][hr].costUsd += g.costUsd;
-          hourlyMatrix[dow][hr].calls += 1;
-        }
-      }
-      for (const dk of seenDatesForSession) {
-        const b = dailyMap.get(dk);
-        if (b) b.sessions += 1;
-      }
-      for (const cp of sDetail.checkpoints) {
-        if (cp.timestampMs) {
-          const dKey = toLocalDateKey(cp.timestampMs);
-          let b = dailyMap.get(dKey);
-          if (!b) {
-            b = {
-              date: dKey,
-              tokens: 0,
-              inputTokens: 0,
-              cacheReadTokens: 0,
-              outputTokens: 0,
-              costUsd: 0,
-              calls: 0,
-              sessions: 0,
-              compactions: 0
-            };
-            dailyMap.set(dKey, b);
-          }
-          b.compactions += 1;
-          const cpTok = (cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0);
-          if (cpTok > 0) {
-            b.tokens += cpTok;
-            b.inputTokens += cp.inputTokens || 0;
-            b.cacheReadTokens += cp.cacheReadTokens || 0;
-            b.outputTokens += cp.outputTokens || 0;
-            b.costUsd += cp.costUsd || 0;
-            b.calls += 1;
-            const dObj = new Date(cp.timestampMs);
-            const dow = (dObj.getDay() + 6) % 7;
-            const hr = dObj.getHours();
-            hourlyMatrix[dow][hr].tokens += cpTok;
-            hourlyMatrix[dow][hr].costUsd += cp.costUsd || 0;
-            hourlyMatrix[dow][hr].calls += 1;
-          }
-        }
-      }
-    }
-
-    records.push({
-      id,
-      summary,
-      resolved,
-      workspaces: parseWorkspaceUris(summary?.workspace_uris),
-      detail: sDetail,
-      lastModifiedIso,
-      firstTs,
-      lastTs
-    });
+    recordMap.set(id, buildMasterRecord(id, summary, rollup));
   }
 
-  // Inherit parent workspace for derived subagents when summary has no workspace_uris
-  const tempMap = new Map(records.map(r => [r.id, r]));
-  for (const rec of records) {
-    if (rec.workspaces.keys.length === 0 && rec.resolved.parentId) {
-      const parent = tempMap.get(rec.resolved.parentId);
-      if (parent && parent.workspaces.keys.length > 0) {
-        rec.workspaces = parent.workspaces;
-      }
-    }
+  cachedSummaryMap = summaryMap;
+  masterNeedsFullRebuild = false;
+  summariesDirty = false;
+  dirtySessionIds.clear();
+
+  if (metrics.newlyParsed >= 5) {
+    persistRollupCacheNow();
+  } else if (rollupCacheDirty) {
+    scheduleRollupPersist();
   }
 
-  records.sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
-
-  const dailyList = Array.from(dailyMap.values())
-    .sort((a, b) => a.date.localeCompare(b.date))
-    .map(b => ({ ...b, costUsd: Number(b.costUsd.toFixed(2)) }));
-
-  const roundedHourly = hourlyMatrix.map(row =>
-    row.map(cell => ({
-      tokens: cell.tokens,
-      costUsd: Number(cell.costUsd.toFixed(2)),
-      calls: cell.calls
-    }))
-  );
-
-  masterIndexCache = {
-    records,
-    recordMap: new Map(records.map(r => [r.id, r])),
-    childrenByParent,
-    heatmap: {
-      daily: dailyList,
-      hourlyMatrix: roundedHourly,
-      minDate: dailyList.length ? dailyList[0].date : null,
-      maxDate: dailyList.length ? dailyList[dailyList.length - 1].date : null
-    },
-    globalMinTs: minTs,
-    globalMaxTs: maxTs,
-    updatedAt: new Date().toISOString()
-  };
-  lastMasterCacheTime = now;
-  return masterIndexCache;
+  return finalizeMasterIndex(recordMap);
 }
 
 function buildActiveSnapshot(r, childrenByParent) {
-  const lastTurn = r.detail.generations[r.detail.generations.length - 1];
+  const s = r.rollup;
   return {
     conversation_id: r.id,
     title: r.resolved.title,
-    latestModel: r.detail.latestModel,
+    latestModel: s.latestModel,
     last_modified_time: new Date(r.lastTs).toISOString(),
-    currentContextTokens: r.detail.currentContextTokens,
-    lastInputTokens: lastTurn?.inputTokens || 0,
-    lastCacheReadTokens: lastTurn?.cacheReadTokens || 0,
-    peakContextTokens: r.detail.peakContextTokens,
-    compactionCount: r.detail.compactionCount,
-    totalCalls: r.detail.totalCalls,
-    estimatedCostUsd: r.detail.estimatedCostUsd,
-    cacheSavingsUsd: r.detail.cacheSavingsUsd,
-    streamTps: r.detail.streamTps,
-    avgTtftSec: r.detail.avgTtftSec,
+    currentContextTokens: s.currentContextTokens,
+    lastInputTokens: s.lastInputTokens || 0,
+    lastCacheReadTokens: s.lastCacheReadTokens || 0,
+    peakContextTokens: s.peakContextTokens,
+    compactionCount: s.compactionCount,
+    totalCalls: s.totalCalls,
+    estimatedCostUsd: s.estimatedCostUsd,
+    cacheSavingsUsd: s.cacheSavingsUsd,
+    streamTps: s.streamTps,
+    avgTtftSec: s.avgTtftSec,
     childCount: (childrenByParent.get(r.id) || []).length,
     workspaceKey: r.workspaces?.primaryKey || '',
     workspaceLabel: r.workspaces?.primaryLabel || ''
@@ -1697,17 +2199,56 @@ function normalizeWorkspaceFilterSet(workspaceFilter) {
   return keys.length > 0 ? new Set(keys) : null;
 }
 
-export function computeWindowStats(rangeStr, exactDateStr, focusConversationId = null, workspaceFilter = null) {
+export function computeWindowStats(
+  rangeStr,
+  exactDateStr,
+  focusConversationId = null,
+  workspaceFilter = null,
+  startDateStr = null,
+  endDateStr = null
+) {
   const master = getMasterIndex();
-  const bounds = getRangeBounds(rangeStr, exactDateStr);
+  const todayKey = toLocalDateKey(Date.now());
+  const cacheKey = `${master.version}|${todayKey}|${rangeStr || ''}|${exactDateStr || ''}|${startDateStr || ''}|${endDateStr || ''}|${workspaceFilter || ''}|${focusConversationId || ''}`;
+  const cachedStats = windowStatsCache.get(cacheKey);
+  if (cachedStats) {
+    windowStatsCache.delete(cacheKey);
+    windowStatsCache.set(cacheKey, cachedStats);
+    return cachedStats;
+  }
+
+  const bounds = getRangeBounds(rangeStr, exactDateStr, startDateStr, endDateStr);
   const contextConfig = getContextLimitConfig();
   const filterWsSet = normalizeWorkspaceFilterSet(workspaceFilter);
 
+  const isUnbounded = bounds.startMs === null && bounds.endMs === null;
+  const startDateKey = bounds.startMs !== null ? toLocalDateKey(bounds.startMs) : null;
+  const endDateKey = bounds.endMs !== null ? toLocalDateKey(bounds.endMs) : null;
+
   const inBounds = (ts) => {
-    if (!ts) return bounds.startMs === null && bounds.endMs === null;
+    if (!ts) return isUnbounded;
     if (bounds.startMs !== null && ts < bounds.startMs) return false;
     if (bounds.endMs !== null && ts > bounds.endMs) return false;
     return true;
+  };
+
+  const inDateBounds = (dKey) => {
+    if (isUnbounded) return true;
+    if (!dKey || dKey === '__nodate__') return false;
+    if (startDateKey && dKey < startDateKey) return false;
+    if (endDateKey && dKey > endDateKey) return false;
+    return true;
+  };
+
+  const addSpeedBucket = (acc, b) => {
+    acc.thinkTokSum += b.thinkTokSum || 0;
+    acc.outTokSum += b.outTokSum || 0;
+    acc.ttftSum += b.ttftSum || 0;
+    acc.ttftCount += b.ttftCount || 0;
+    acc.streamTokSum += b.streamTokSum || 0;
+    acc.streamSecSum += b.streamSecSum || 0;
+    acc.e2eTokSum += b.e2eTokSum || 0;
+    acc.e2eSecSum += b.e2eSecSum || 0;
   };
 
   const modelTotals = {};
@@ -1733,12 +2274,12 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
   const sessionList = [];
 
   for (const rec of master.records) {
-    const d = rec.detail;
+    const d = rec.rollup;
     const childIds = master.childrenByParent.get(rec.id) || [];
     const ws = rec.workspaces || { uris: [], keys: [], labels: [], primaryKey: '', primaryLabel: '' };
     const matchesWorkspace = !filterWsSet || ws.keys.some(k => filterWsSet.has(k));
 
-    if (!d || d.generations.length === 0) {
+    if (!d || d.generationCount === 0) {
       if (inBounds(rec.lastTs) && matchesWorkspace) {
         typeCounts[rec.resolved.sessionType] = (typeCounts[rec.resolved.sessionType] || 0) + 1;
         sessionList.push({
@@ -1777,52 +2318,54 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
       continue;
     }
 
-    const filteredTurns = (bounds.startMs === null && bounds.endMs === null)
-      ? d.generations
-      : d.generations.filter(g => inBounds(g.timestampMs));
-
-    const filteredCps = (bounds.startMs === null && bounds.endMs === null)
-      ? d.checkpoints
-      : d.checkpoints.filter(cp => inBounds(cp.timestampMs));
-
-    const billedFilteredCps = filteredCps.filter(
-      cp => ((cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0)) > 0
-    );
-
-    if (filteredTurns.length === 0 && billedFilteredCps.length === 0) continue;
-
     const sessModelCounts = {};
     const sessSpeedAcc = createSpeedAcc();
     let sIn = 0, sCache = 0, sOut = 0, sThink = 0, sResp = 0, sCost = 0, sSave = 0;
     let sLastTs = 0;
+    let sTurns = 0;
+    let cpCount = 0;
+    let cpBilledCount = 0;
+    const matchedBuckets = [];
+    const matchedBilledCps = [];
 
-    for (const g of filteredTurns) {
-      if (g.timestampMs && g.timestampMs > sLastTs) sLastTs = g.timestampMs;
-      sIn += g.inputTokens;
-      sCache += g.cacheReadTokens;
-      sOut += g.outputTokens;
-      sThink += g.thinkingTokens;
-      sResp += g.responseTokens;
-      sCost += g.costUsd;
-      sSave += g.cacheSavingsUsd;
-      sessModelCounts[g.model] = (sessModelCounts[g.model] || 0) + 1;
-      addTurnToSpeedAcc(sessSpeedAcc, g);
+    for (const b of d.dailyModelBuckets || []) {
+      if (!inDateBounds(b.date)) continue;
+      matchedBuckets.push(b);
+      if (b.lastTs && b.lastTs > sLastTs) sLastTs = b.lastTs;
+      sIn += b.inputTokens;
+      sCache += b.cacheReadTokens;
+      sOut += b.outputTokens;
+      sThink += b.thinkingTokens;
+      sResp += b.responseTokens;
+      sCost += b.costUsd;
+      sSave += b.cacheSavingsUsd;
+      sTurns += b.calls;
+      sessModelCounts[b.model] = (sessModelCounts[b.model] || 0) + b.calls;
+      addSpeedBucket(sessSpeedAcc, b);
     }
 
-    for (const cp of billedFilteredCps) {
-      if (cp.timestampMs && cp.timestampMs > sLastTs) sLastTs = cp.timestampMs;
-      const cpModel = cp.model || d.latestModel || 'unknown';
-      sIn += cp.inputTokens || 0;
-      sCache += cp.cacheReadTokens || 0;
-      sOut += cp.outputTokens || 0;
-      sThink += cp.thinkingTokens || 0;
-      sResp += cp.responseTokens || 0;
-      sCost += cp.costUsd || 0;
-      sSave += cp.cacheSavingsUsd || 0;
-      sessModelCounts[cpModel] = (sessModelCounts[cpModel] || 0) + 1;
+    for (const cpDay of d.dailyCheckpoints || []) {
+      if (!inDateBounds(cpDay.date)) continue;
+      cpCount += cpDay.count;
+      for (const bc of cpDay.billed || []) {
+        matchedBilledCps.push(bc);
+        if (bc.lastTs && bc.lastTs > sLastTs) sLastTs = bc.lastTs;
+        const cpModel = bc.model || d.latestModel || 'unknown';
+        sIn += bc.inputTokens || 0;
+        sCache += bc.cacheReadTokens || 0;
+        sOut += bc.outputTokens || 0;
+        sThink += bc.thinkingTokens || 0;
+        sResp += bc.responseTokens || 0;
+        sCost += bc.costUsd || 0;
+        sSave += bc.cacheSavingsUsd || 0;
+        cpBilledCount += bc.calls || 0;
+        sessModelCounts[cpModel] = (sessModelCounts[cpModel] || 0) + (bc.calls || 0);
+      }
     }
 
-    const billedCalls = filteredTurns.length + billedFilteredCps.length;
+    if (sTurns === 0 && cpBilledCount === 0) continue;
+
+    const billedCalls = sTurns + cpBilledCount;
     const sTokens = sIn + sCache + sOut;
 
     // Always aggregate workspace breakdown across all workspaces in this time window
@@ -1854,34 +2397,30 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
     wsBucket.outputTokens += sOut;
     wsBucket.estimatedCostUsd += sCost;
     wsBucket.cacheSavingsUsd += sSave;
-    wsBucket.compactions += filteredCps.length;
+    wsBucket.compactions += cpCount;
     if (sLastTs > wsBucket.lastActiveMs) wsBucket.lastActiveMs = sLastTs;
 
     if (!matchesWorkspace) continue;
 
-    for (const g of filteredTurns) {
-      if (g.timestampMs) {
-        if (windowMinTs === null || g.timestampMs < windowMinTs) windowMinTs = g.timestampMs;
-        if (windowMaxTs === null || g.timestampMs > windowMaxTs) windowMaxTs = g.timestampMs;
-      }
-      const tTok = g.inputTokens + g.cacheReadTokens + g.outputTokens;
-      modelTotals[g.model] = (modelTotals[g.model] || 0) + 1;
-      modelCosts[g.model] = (modelCosts[g.model] || 0) + g.costUsd;
-      modelTokens[g.model] = (modelTokens[g.model] || 0) + tTok;
-      addTurnToSpeedAcc(globalSpeedAcc, g);
-      if (!modelSpeedAccMap[g.model]) modelSpeedAccMap[g.model] = createSpeedAcc();
-      addTurnToSpeedAcc(modelSpeedAccMap[g.model], g);
+    for (const b of matchedBuckets) {
+      if (b.firstTs && (windowMinTs === null || b.firstTs < windowMinTs)) windowMinTs = b.firstTs;
+      if (b.lastTs && (windowMaxTs === null || b.lastTs > windowMaxTs)) windowMaxTs = b.lastTs;
+      const tTok = b.inputTokens + b.cacheReadTokens + b.outputTokens;
+      modelTotals[b.model] = (modelTotals[b.model] || 0) + b.calls;
+      modelCosts[b.model] = (modelCosts[b.model] || 0) + b.costUsd;
+      modelTokens[b.model] = (modelTokens[b.model] || 0) + tTok;
+      addSpeedBucket(globalSpeedAcc, b);
+      if (!modelSpeedAccMap[b.model]) modelSpeedAccMap[b.model] = createSpeedAcc();
+      addSpeedBucket(modelSpeedAccMap[b.model], b);
     }
 
-    for (const cp of billedFilteredCps) {
-      if (cp.timestampMs) {
-        if (windowMinTs === null || cp.timestampMs < windowMinTs) windowMinTs = cp.timestampMs;
-        if (windowMaxTs === null || cp.timestampMs > windowMaxTs) windowMaxTs = cp.timestampMs;
-      }
-      const cpTok = (cp.inputTokens || 0) + (cp.cacheReadTokens || 0) + (cp.outputTokens || 0);
-      const cpModel = cp.model || d.latestModel || 'unknown';
-      modelTotals[cpModel] = (modelTotals[cpModel] || 0) + 1;
-      modelCosts[cpModel] = (modelCosts[cpModel] || 0) + (cp.costUsd || 0);
+    for (const bc of matchedBilledCps) {
+      if (bc.firstTs && (windowMinTs === null || bc.firstTs < windowMinTs)) windowMinTs = bc.firstTs;
+      if (bc.lastTs && (windowMaxTs === null || bc.lastTs > windowMaxTs)) windowMaxTs = bc.lastTs;
+      const cpTok = (bc.inputTokens || 0) + (bc.cacheReadTokens || 0) + (bc.outputTokens || 0);
+      const cpModel = bc.model || d.latestModel || 'unknown';
+      modelTotals[cpModel] = (modelTotals[cpModel] || 0) + (bc.calls || 0);
+      modelCosts[cpModel] = (modelCosts[cpModel] || 0) + (bc.costUsd || 0);
       modelTokens[cpModel] = (modelTokens[cpModel] || 0) + cpTok;
     }
 
@@ -1896,7 +2435,7 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
     totalTokens += sTokens;
     totalEstimatedCostUsd += sCost;
     totalCacheSavingsUsd += sSave;
-    totalCompactions += filteredCps.length;
+    totalCompactions += cpCount;
     typeCounts[rec.resolved.sessionType] = (typeCounts[rec.resolved.sessionType] || 0) + 1;
 
     const sSpeed = finalizeSpeedAcc(sessSpeedAcc);
@@ -1951,13 +2490,13 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
     .sort((a, b) => b.estimatedCostUsd - a.estimatedCostUsd || b.totalTokens - a.totalTokens);
 
   const activeSessions = master.records
-    .filter(r => r.detail && r.detail.totalCalls > 0 && r.resolved.sessionType === 'main')
+    .filter(r => r.rollup && r.rollup.totalCalls > 0 && r.resolved.sessionType === 'main')
     .slice(0, 8)
     .map(r => buildActiveSnapshot(r, master.childrenByParent));
 
   if (focusConversationId && !activeSessions.some(s => s.conversation_id === focusConversationId)) {
     const focusRec = master.recordMap.get(focusConversationId);
-    if (focusRec && focusRec.detail && focusRec.detail.totalCalls > 0) {
+    if (focusRec && focusRec.rollup && focusRec.rollup.totalCalls > 0) {
       activeSessions.unshift(buildActiveSnapshot(focusRec, master.childrenByParent));
     }
   }
@@ -1977,12 +2516,14 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
     ? Number(((totalCacheSavingsUsd / uncachedTotalCost) * 100).toFixed(1))
     : 0;
 
-  return {
+  const result = {
     range: bounds.range,
     date: bounds.date,
+    startDate: bounds.startDate,
+    endDate: bounds.endDate,
     workspaceFilter: filterWsSet ? Array.from(filterWsSet) : null,
-    dateFrom: windowMinTs ? toLocalDateKey(windowMinTs) : (bounds.startMs ? toLocalDateKey(bounds.startMs) : master.heatmap.minDate),
-    dateTo: windowMaxTs ? toLocalDateKey(windowMaxTs) : toLocalDateKey(Date.now()),
+    dateFrom: bounds.startDate || (windowMinTs ? toLocalDateKey(windowMinTs) : (bounds.startMs ? toLocalDateKey(bounds.startMs) : master.heatmap.minDate)),
+    dateTo: bounds.endDate || (windowMaxTs ? toLocalDateKey(windowMaxTs) : toLocalDateKey(Date.now())),
     totalSessions: sessionList.length,
     totalCalls,
     totalTokens,
@@ -2006,19 +2547,90 @@ export function computeWindowStats(rangeStr, exactDateStr, focusConversationId =
     sessions: sessionList,
     updatedAt: master.updatedAt
   };
+
+  if (windowStatsCache.size >= WINDOW_STATS_CACHE_MAX) {
+    const oldestKey = windowStatsCache.keys().next().value;
+    if (oldestKey !== undefined) windowStatsCache.delete(oldestKey);
+  }
+  windowStatsCache.set(cacheKey, result);
+  return result;
 }
 
-export function getOverviewData({ range = '7d', date = null, focusConversationId = null, workspace = null } = {}) {
-  const stats = computeWindowStats(range, date, focusConversationId, workspace);
+export function getOverviewData({
+  range = '7d',
+  date = null,
+  startDate = null,
+  endDate = null,
+  focusConversationId = null,
+  workspace = null
+} = {}) {
+  const stats = computeWindowStats(range, date, focusConversationId, workspace, startDate, endDate);
   const { sessions: _omit, ...overviewPayload } = stats;
   return overviewPayload;
 }
 
-export function getWorkspaceBreakdown({ range = '7d', date = null } = {}) {
-  const stats = computeWindowStats(range, date);
+export function getDashboardData({
+  range = '7d',
+  date = null,
+  startDate = null,
+  endDate = null,
+  focusConversationId = null,
+  workspace = null,
+  search = '',
+  model = '',
+  type = '',
+  page = 1,
+  pageSize = 500,
+  includeHeatmap = false
+} = {}) {
+  const stats = computeWindowStats(range, date, focusConversationId, workspace, startDate, endDate);
+  const { sessions: allSessions, ...overview } = stats;
+
+  const q = String(search || '').toLowerCase().trim();
+  let filtered = allSessions;
+  if (q) {
+    filtered = filtered.filter(s =>
+      s.title.toLowerCase().includes(q) ||
+      s.conversation_id.toLowerCase().includes(q)
+    );
+  }
+  if (model) {
+    filtered = filtered.filter(s => s.modelsUsed.includes(model));
+  }
+  if (type && type !== 'ALL') {
+    filtered = filtered.filter(s => s.sessionType === type);
+  }
+
+  const total = filtered.length;
+  const safePage = Math.max(1, Number(page) || 1);
+  const safePageSize = Math.max(1, Math.min(1000, Number(pageSize) || 500));
+  const startIndex = (safePage - 1) * safePageSize;
+  const paginated = filtered.slice(startIndex, startIndex + safePageSize);
+
+  const payload = {
+    overview,
+    sessions: paginated,
+    total,
+    page: safePage,
+    pageSize: safePageSize
+  };
+  if (includeHeatmap) {
+    const master = getMasterIndex();
+    payload.heatmap = {
+      ...master.heatmap,
+      updatedAt: master.updatedAt
+    };
+  }
+  return payload;
+}
+
+export function getWorkspaceBreakdown({ range = '7d', date = null, startDate = null, endDate = null } = {}) {
+  const stats = computeWindowStats(range, date, null, null, startDate, endDate);
   return {
     range: stats.range,
     date: stats.date,
+    startDate: stats.startDate,
+    endDate: stats.endDate,
     dateFrom: stats.dateFrom,
     dateTo: stats.dateTo,
     totalEstimatedCostUsd: stats.totalEstimatedCostUsd,
@@ -2039,6 +2651,8 @@ export function getHeatmapData() {
 export function getSessionsList({
   range = '7d',
   date = null,
+  startDate = null,
+  endDate = null,
   search = '',
   model = '',
   type = '',
@@ -2046,7 +2660,7 @@ export function getSessionsList({
   page = 1,
   pageSize = 500
 } = {}) {
-  const stats = computeWindowStats(range, date, null, workspace);
+  const stats = computeWindowStats(range, date, null, workspace, startDate, endDate);
   const q = String(search || '').toLowerCase().trim();
   let filtered = stats.sessions;
 
@@ -2124,23 +2738,24 @@ export function getSessionAuditDetail(sessionIdOrPrefix, { includeTurns = true }
   const mapChildRecord = (cid) => {
     const cr = master.recordMap.get(cid);
     if (!cr) return null;
+    const d = cr.rollup || cr.detail;
     return {
       conversation_id: cr.id,
       title: cr.resolved.title,
       agentName: cr.resolved.agentName || 'subagent',
       parentId: cr.resolved.parentId || resolvedId,
-      latestModel: cr.detail?.latestModel || 'unknown',
-      modelsUsed: cr.detail ? Object.keys(cr.detail.modelCounts) : [],
-      calls: cr.detail?.totalCalls || 0,
-      totalInputTokens: cr.detail?.totalInputTokens || 0,
-      totalCacheReadTokens: cr.detail?.totalCacheReadTokens || 0,
-      totalOutputTokens: cr.detail?.totalOutputTokens || 0,
-      totalTokens: cr.detail
-        ? (cr.detail.totalInputTokens + cr.detail.totalCacheReadTokens + cr.detail.totalOutputTokens)
+      latestModel: d?.latestModel || 'unknown',
+      modelsUsed: d ? (d.modelsUsed || Object.keys(d.modelCounts || {})) : [],
+      calls: d?.totalCalls || 0,
+      totalInputTokens: d?.totalInputTokens || 0,
+      totalCacheReadTokens: d?.totalCacheReadTokens || 0,
+      totalOutputTokens: d?.totalOutputTokens || 0,
+      totalTokens: d
+        ? (d.totalInputTokens + d.totalCacheReadTokens + d.totalOutputTokens)
         : 0,
-      estimatedCostUsd: cr.detail?.estimatedCostUsd || 0,
-      cacheSavingsUsd: cr.detail?.cacheSavingsUsd || 0,
-      compactionCount: cr.detail?.compactionCount || 0,
+      estimatedCostUsd: d?.estimatedCostUsd || 0,
+      cacheSavingsUsd: d?.cacheSavingsUsd || 0,
+      compactionCount: d?.compactionCount || 0,
       firstTimestampMs: cr.firstTs,
       lastTimestampMs: cr.lastTs
     };
@@ -2364,7 +2979,6 @@ export function getTodayTotalCostUsd({ maxCacheAgeMs = 60000 } = {}) {
     return cached.costUsd;
   }
 
-  invalidateMasterIndexCache();
   const ov = getOverviewData({ range: 'today' });
   const costUsd = Number((ov.totalEstimatedCostUsd || 0).toFixed(2));
   saveJsonState('today-cost-cache.json', {

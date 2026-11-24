@@ -48,11 +48,12 @@ import GuardSettingsDrawer from './components/GuardSettingsDrawer';
 import {
   apiFetch,
   canJumpHostConversation,
-  createApiEventSource,
   getHostConversationId,
   isInSidecar,
+  isPaneVisibleNow,
   jumpToHostConversation,
   observeHostTheme,
+  observePaneVisibility,
   subscribeHostWorkspaces
 } from './sidecarBridge';
 
@@ -65,6 +66,13 @@ function parseSessionIdFromHash(): string | null {
   const h = window.location.hash || '';
   const m = h.match(/^#\/session\/([^/?#]+)/);
   return m ? decodeURIComponent(m[1]) : null;
+}
+
+function formatLocalDateInput(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 function getInitialPrivacyMode(): boolean {
@@ -85,7 +93,10 @@ export default function App() {
   const [heatmap, setHeatmap] = useState<HeatmapData | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [sseConnected, setSseConnected] = useState(false);
+  const [isPaneActive, setIsPaneActive] = useState<boolean>(() => isPaneVisibleNow());
+  const [syncStatus, setSyncStatus] = useState<'active' | 'idle' | 'offline'>(() =>
+    isPaneVisibleNow() ? 'active' : 'idle'
+  );
   const [privacyMode, setPrivacyMode] = useState<boolean>(() => getInitialPrivacyMode());
   const [inSidecar] = useState<boolean>(() => isInSidecar());
   const [hostConversationId, setHostConversationId] = useState<string | null>(() => getHostConversationId());
@@ -109,9 +120,19 @@ export default function App() {
     });
   };
 
-  // Global time range (defaults to 7d) + optional heatmap exact date drill-down
+  // Global time range (defaults to 7d) + optional heatmap exact date or custom date range
   const [timeRange, setTimeRange] = useState<TimeRange>('7d');
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [customRange, setCustomRange] = useState<{ start: string; end: string } | null>(null);
+  const [showDatePicker, setShowDatePicker] = useState<boolean>(false);
+  const todayStr = formatLocalDateInput(new Date());
+  const [draftStart, setDraftStart] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 6);
+    return formatLocalDateInput(d);
+  });
+  const [draftEnd, setDraftEnd] = useState<string>(() => formatLocalDateInput(new Date()));
+  const datePickerWrapRef = useRef<HTMLDivElement | null>(null);
 
   // Filters & sorting
   const [search, setSearch] = useState('');
@@ -132,9 +153,28 @@ export default function App() {
 
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
   const hostConvRef = useRef<string | null>(hostConversationId);
-  const rangeRef = useRef<{ range: TimeRange; date: string | null; workspace: string | null }>({
+  const isPaneActiveRef = useRef<boolean>(isPaneActive);
+  const heatmapRef = useRef<HeatmapData | null>(heatmap);
+  const dashboardAbortRef = useRef<AbortController | null>(null);
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const fetchSeqRef = useRef<number>(0);
+  const lastServerVersionRef = useRef<number | null>(null);
+  const lastDateKeyRef = useRef<string>(formatLocalDateInput(new Date()));
+  const hasLoadedOnceRef = useRef<boolean>(false);
+  const dirtyParamsWhileHiddenRef = useRef<boolean>(false);
+  const lastFetchedParamsKeyRef = useRef<string | null>(null);
+  const lastLoadedDetailIdRef = useRef<string | null>(null);
+  const versionProbeInFlightRef = useRef<boolean>(false);
+  const lastFocusProbeAtRef = useRef<number>(0);
+  const rangeRef = useRef<{
+    range: TimeRange;
+    date: string | null;
+    customRange: { start: string; end: string } | null;
+    workspace: string | null;
+  }>({
     range: timeRange,
     date: selectedDate,
+    customRange,
     workspace: selectedWorkspace
   });
   const savedScrollYRef = useRef<number>(0);
@@ -148,8 +188,35 @@ export default function App() {
   }, [hostConversationId]);
 
   useEffect(() => {
-    rangeRef.current = { range: timeRange, date: selectedDate, workspace: selectedWorkspace };
-  }, [timeRange, selectedDate, selectedWorkspace]);
+    isPaneActiveRef.current = isPaneActive;
+  }, [isPaneActive]);
+
+  useEffect(() => {
+    heatmapRef.current = heatmap;
+  }, [heatmap]);
+
+  useEffect(() => {
+    rangeRef.current = { range: timeRange, date: selectedDate, customRange, workspace: selectedWorkspace };
+  }, [timeRange, selectedDate, customRange, selectedWorkspace]);
+
+  // Close custom date picker on outside click or Escape
+  useEffect(() => {
+    if (!showDatePicker) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (datePickerWrapRef.current && !datePickerWrapRef.current.contains(e.target as Node)) {
+        setShowDatePicker(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowDatePicker(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [showDatePicker]);
 
   // Responsive compact mode for Antigravity narrow Aux Pane (< 720px)
   useEffect(() => {
@@ -158,25 +225,42 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  // Sidecar host theme sync, workspace subscription & active conversation tracking
+  // Visibility-gated pane activation (only fetch/poll when user actually opens this pane)
+  useEffect(() => {
+    const initial = isPaneVisibleNow();
+    setIsPaneActive(initial);
+    if (!initial) setSyncStatus('idle');
+    return observePaneVisibility((visible) => {
+      setIsPaneActive(visible);
+    });
+  }, []);
+
+  // Sidecar host theme sync & workspace subscription
   useEffect(() => {
     const stopTheme = observeHostTheme();
     const stopWs = subscribeHostWorkspaces((uris) => {
       setHostWorkspaceUris(uris);
     });
-    const timer = window.setInterval(() => {
+    return () => {
+      stopTheme();
+      stopWs();
+    };
+  }, []);
+
+  // Active conversation tracking (only runs while pane is visible)
+  useEffect(() => {
+    if (!isPaneActive) return;
+    const checkHostConv = () => {
       const nextHostId = getHostConversationId();
       if (nextHostId && nextHostId !== hostConvRef.current) {
         setHostConversationId(nextHostId);
         setFollowHost(true);
       }
-    }, 1500);
-    return () => {
-      stopTheme();
-      stopWs();
-      window.clearInterval(timer);
     };
-  }, []);
+    checkHostConv();
+    const timer = window.setInterval(checkHostConv, 1500);
+    return () => window.clearInterval(timer);
+  }, [isPaneActive]);
 
   // Cross-tab color-scheme sync
   useEffect(() => {
@@ -221,100 +305,258 @@ export default function App() {
   }, []);
 
   const fetchSessionDetail = useCallback(async (id: string, silent = false) => {
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
     if (!silent) setDetailLoading(true);
     try {
-      const res = await apiFetch(`./api/sessions/${encodeURIComponent(id)}`);
+      const res = await apiFetch(`./api/sessions/${encodeURIComponent(id)}`, {
+        signal: controller.signal
+      });
       if (res.ok) {
         const data = await res.json();
-        if (activeSessionIdRef.current === id) {
+        if (activeSessionIdRef.current === id && !controller.signal.aborted) {
+          lastLoadedDetailIdRef.current = id;
           setSessionDetail(data);
         }
       }
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('Session detail error:', err);
     } finally {
-      if (!silent) setDetailLoading(false);
+      if (!silent && detailAbortRef.current === controller) setDetailLoading(false);
     }
   }, []);
 
   const fetchDashboardData = useCallback(
-    async (range: TimeRange, date: string | null, includeHeatmap = false, workspace: string | null = null) => {
+    async (
+      range: TimeRange,
+      date: string | null,
+      includeHeatmap = false,
+      workspace: string | null = null,
+      custom: { start: string; end: string } | null = null
+    ) => {
+      dashboardAbortRef.current?.abort();
+      const controller = new AbortController();
+      dashboardAbortRef.current = controller;
+      const seq = ++fetchSeqRef.current;
+
       try {
         setRefreshing(true);
         const q = date
           ? `date=${encodeURIComponent(date)}`
-          : `range=${encodeURIComponent(range)}`;
+          : custom
+            ? `start=${encodeURIComponent(custom.start)}&end=${encodeURIComponent(custom.end)}`
+            : `range=${encodeURIComponent(range)}`;
         const wsParam = workspace ? `&workspace=${encodeURIComponent(workspace)}` : '';
         const focusParam = hostConvRef.current
           ? `&focusConversationId=${encodeURIComponent(hostConvRef.current)}`
           : '';
-        const reqs: Promise<Response>[] = [
-          apiFetch(`./api/overview?${q}${wsParam}${focusParam}`),
-          apiFetch(`./api/sessions?${q}${wsParam}&pageSize=500`)
-        ];
-        if (includeHeatmap) reqs.push(apiFetch('./api/heatmap'));
+        const hmParam = includeHeatmap ? '&includeHeatmap=1' : '&includeHeatmap=0';
 
-        const responses = await Promise.all(reqs);
-        if (responses[0].ok) setOverview(await responses[0].json());
-        if (responses[1].ok) {
-          const sd = await responses[1].json();
-          setSessions(sd.sessions || []);
+        const res = await apiFetch(`./api/dashboard?${q}${wsParam}${focusParam}${hmParam}&pageSize=500`, {
+          signal: controller.signal
+        });
+        if (!res.ok) {
+          if (seq === fetchSeqRef.current) setSyncStatus('offline');
+          return;
         }
-        if (includeHeatmap && responses[2]?.ok) {
-          setHeatmap(await responses[2].json());
+        const data = await res.json();
+        if (seq !== fetchSeqRef.current || controller.signal.aborted) return;
+
+        if (data.overview) setOverview(data.overview);
+        if (Array.isArray(data.sessions)) setSessions(data.sessions);
+        if (includeHeatmap && data.heatmap) setHeatmap(data.heatmap);
+        if (typeof data.version === 'number') {
+          lastServerVersionRef.current = data.version;
         }
+        lastDateKeyRef.current = formatLocalDateInput(new Date());
+        hasLoadedOnceRef.current = true;
+        dirtyParamsWhileHiddenRef.current = false;
+        setSyncStatus(isPaneActiveRef.current ? 'active' : 'idle');
       } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
         console.error('Fetch error:', err);
+        if (seq === fetchSeqRef.current) setSyncStatus('offline');
       } finally {
-        setLoading(false);
-        setRefreshing(false);
+        if (seq === fetchSeqRef.current) {
+          setLoading(false);
+          setRefreshing(false);
+        }
       }
     },
     []
   );
 
-  // Re-fetch when timeRange, selectedDate, selectedWorkspace, or hostConversationId changes
-  useEffect(() => {
-    fetchDashboardData(timeRange, selectedDate, heatmap === null, selectedWorkspace);
-  }, [timeRange, selectedDate, selectedWorkspace, hostConversationId, fetchDashboardData]);
+  const probeServerVersion = useCallback(async () => {
+    if (!isPaneActiveRef.current || !hasLoadedOnceRef.current || versionProbeInFlightRef.current) {
+      return;
+    }
+    versionProbeInFlightRef.current = true;
+    try {
+      const res = await apiFetch('./api/version');
+      if (!res.ok) {
+        if (isPaneActiveRef.current) setSyncStatus('offline');
+        return;
+      }
+      const data = await res.json();
+      if (!isPaneActiveRef.current) return;
 
-  // Fetch detail when activeSessionId changes
+      const dateChanged = Boolean(data.dateKey && data.dateKey !== lastDateKeyRef.current);
+      const versionChanged =
+        typeof data.version === 'number' && data.version !== lastServerVersionRef.current;
+
+      if (versionChanged || dateChanged) {
+        const { range, date, customRange: cRange, workspace } = rangeRef.current;
+        await fetchDashboardData(range, date, dateChanged || heatmapRef.current === null, workspace, cRange);
+        if (activeSessionIdRef.current && isPaneActiveRef.current) {
+          await fetchSessionDetail(activeSessionIdRef.current, true);
+        }
+      } else {
+        setSyncStatus('active');
+      }
+    } catch {
+      if (isPaneActiveRef.current) setSyncStatus('offline');
+    } finally {
+      versionProbeInFlightRef.current = false;
+    }
+  }, [fetchDashboardData, fetchSessionDetail]);
+
+  const paramsKey = `${timeRange}|${selectedDate || ''}|${customRange ? `${customRange.start}:${customRange.end}` : ''}|${selectedWorkspace || ''}|${hostConversationId || ''}`;
+
+  // Fetch on visibility activation or filter change (strictly silent & idle when pane is hidden)
+  useEffect(() => {
+    if (!isPaneActive) {
+      if (lastFetchedParamsKeyRef.current !== null && lastFetchedParamsKeyRef.current !== paramsKey) {
+        dirtyParamsWhileHiddenRef.current = true;
+      }
+      dashboardAbortRef.current?.abort();
+      detailAbortRef.current?.abort();
+      setSyncStatus('idle');
+      return;
+    }
+
+    if (
+      !hasLoadedOnceRef.current ||
+      dirtyParamsWhileHiddenRef.current ||
+      lastFetchedParamsKeyRef.current !== paramsKey
+    ) {
+      lastFetchedParamsKeyRef.current = paramsKey;
+      fetchDashboardData(timeRange, selectedDate, heatmapRef.current === null, selectedWorkspace, customRange);
+    } else {
+      void probeServerVersion();
+    }
+  }, [
+    isPaneActive,
+    paramsKey,
+    timeRange,
+    selectedDate,
+    customRange,
+    selectedWorkspace,
+    fetchDashboardData,
+    probeServerVersion
+  ]);
+
+  // Fetch detail when activeSessionId changes (gated by visibility)
   useEffect(() => {
     if (!activeSessionId) {
+      lastLoadedDetailIdRef.current = null;
       setSessionDetail(null);
       return;
     }
-    fetchSessionDetail(activeSessionId, false);
-  }, [activeSessionId, fetchSessionDetail]);
+    if (!isPaneActive) return;
+    const isSameSession = lastLoadedDetailIdRef.current === activeSessionId;
+    fetchSessionDetail(activeSessionId, isSameSession);
+  }, [activeSessionId, isPaneActive, fetchSessionDetail]);
 
-  // SSE live updates
+  // Lightweight HTTP/1.1-safe version polling (replaces persistent SSE EventSource; paused when hidden)
   useEffect(() => {
-    const es = createApiEventSource('./api/events');
-    es.onopen = () => setSseConnected(true);
-    es.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'update') {
-          const { range, date, workspace } = rangeRef.current;
-          fetchDashboardData(range, date, true, workspace);
-          if (activeSessionIdRef.current) {
-            fetchSessionDetail(activeSessionIdRef.current, true);
-          }
-        }
-      } catch {}
+    if (!isPaneActive) return;
+    const timer = window.setInterval(() => {
+      void probeServerVersion();
+    }, 3000);
+    const onFocus = () => {
+      const now = Date.now();
+      if (now - lastFocusProbeAtRef.current < 1000) return;
+      lastFocusProbeAtRef.current = now;
+      void probeServerVersion();
     };
-    es.onerror = () => setSseConnected(false);
-    return () => es.close();
-  }, [fetchDashboardData, fetchSessionDetail]);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [isPaneActive, probeServerVersion]);
 
   const handleManualRefresh = () => {
-    fetchDashboardData(timeRange, selectedDate, true, selectedWorkspace);
+    fetchDashboardData(timeRange, selectedDate, true, selectedWorkspace, customRange);
     if (activeSessionId) fetchSessionDetail(activeSessionId, false);
   };
 
-  const handleSelectTimeRange = (r: TimeRange) => {
+  const handleSelectTimeRange = (r: Exclude<TimeRange, 'custom'>) => {
     setSelectedDate(null);
+    setCustomRange(null);
+    setShowDatePicker(false);
     setTimeRange(r);
+  };
+
+  const handleToggleCustomPicker = () => {
+    setShowDatePicker((prev) => {
+      const next = !prev;
+      if (next) {
+        if (customRange) {
+          setDraftStart(customRange.start);
+          setDraftEnd(customRange.end);
+        } else if (selectedDate) {
+          setDraftStart(selectedDate);
+          setDraftEnd(selectedDate);
+        } else if (overview?.dateFrom && overview?.dateTo) {
+          setDraftStart(overview.dateFrom);
+          setDraftEnd(overview.dateTo);
+        }
+      }
+      return next;
+    });
+  };
+
+  const applyCustomDateRange = (startStr: string, endStr: string) => {
+    if (!startStr && !endStr) return;
+    let s = startStr || endStr;
+    let e = endStr || startStr;
+    if (s > e) [s, e] = [e, s];
+    setDraftStart(s);
+    setDraftEnd(e);
+    setSelectedDate(null);
+    setCustomRange({ start: s, end: e });
+    setTimeRange('custom');
+    setShowDatePicker(false);
+  };
+
+  const applyQuickCustomPreset = (preset: 'yesterday' | 'this_week' | 'this_month' | 'last_month') => {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    if (preset === 'yesterday') {
+      const y = new Date(today);
+      y.setDate(y.getDate() - 1);
+      const key = formatLocalDateInput(y);
+      applyCustomDateRange(key, key);
+      return;
+    }
+    if (preset === 'this_week') {
+      const dow = (today.getDay() + 6) % 7; // Mon=0
+      const start = new Date(today);
+      start.setDate(start.getDate() - dow);
+      applyCustomDateRange(formatLocalDateInput(start), formatLocalDateInput(today));
+      return;
+    }
+    if (preset === 'this_month') {
+      const start = new Date(today.getFullYear(), today.getMonth(), 1);
+      applyCustomDateRange(formatLocalDateInput(start), formatLocalDateInput(today));
+      return;
+    }
+    const start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+    const end = new Date(today.getFullYear(), today.getMonth(), 0);
+    applyCustomDateRange(formatLocalDateInput(start), formatLocalDateInput(end));
   };
 
   // Derived latest activity timestamp per model from sessions
@@ -475,9 +717,13 @@ export default function App() {
   const effectiveLimit = overview?.contextConfig?.effectiveLimit || 256000;
   const rangeCaption = selectedDate
     ? `单日视图 · ${selectedDate}`
-    : overview?.dateFrom && overview?.dateTo
-      ? `${overview.dateFrom} 至 ${overview.dateTo}`
-      : '加载中';
+    : customRange
+      ? customRange.start === customRange.end
+        ? `自选单日 · ${customRange.start}`
+        : `自定义 · ${customRange.start} 至 ${customRange.end}`
+      : overview?.dateFrom && overview?.dateTo
+        ? `${overview.dateFrom} 至 ${overview.dateTo}`
+        : '加载中';
 
   return (
     <div className={`app-shell ${inSidecar ? 'in-sidecar' : ''} ${isCompact ? 'compact-mode' : ''}`}>
@@ -503,29 +749,41 @@ export default function App() {
                 </span>
               </button>
               <span
-                className={`live-dot-inline ${sseConnected ? '' : 'offline'}`}
+                className={`live-dot-inline ${syncStatus === 'active' ? '' : syncStatus}`}
                 title={
-                  sseConnected
+                  syncStatus === 'active'
                     ? overview?.updatedAt
                       ? `实时同步中 · ${new Date(overview.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
                       : '实时同步中'
-                    : 'SSE 连接已断开'
+                    : syncStatus === 'idle'
+                      ? '后台休眠中（面板打开时自动恢复同步）'
+                      : '本地服务连接中断'
                 }
-                aria-label={sseConnected ? '实时同步中' : '连接已断开'}
+                aria-label={
+                  syncStatus === 'active'
+                    ? '实时同步中'
+                    : syncStatus === 'idle'
+                      ? '后台休眠'
+                      : '连接已断开'
+                }
               />
             </div>
 
             <div className="header-utility-group">
               <div
-                className={`live-pill ${sseConnected ? '' : 'offline'}`}
+                className={`live-pill ${syncStatus === 'active' ? '' : syncStatus}`}
                 title={
-                  overview?.updatedAt
-                    ? `最近同步：${new Date(overview.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
-                    : '等待本地数据库连接'
+                  syncStatus === 'idle'
+                    ? '当前侧栏处于后台隐藏态，已暂停同步以节省连接与资源'
+                    : overview?.updatedAt
+                      ? `最近同步：${new Date(overview.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+                      : '等待本地数据库连接'
                 }
               >
                 <span className="live-dot" aria-hidden="true" />
-                <span>{sseConnected ? '实时同步' : '已断开'}</span>
+                <span>
+                  {syncStatus === 'active' ? '实时同步' : syncStatus === 'idle' ? '后台休眠' : '已断开'}
+                </span>
               </div>
 
               {!activeSessionId && hostWorkspaceUris.length > 0 && (
@@ -600,26 +858,134 @@ export default function App() {
           </div>
 
           {!activeSessionId && (
-            <div className="header-range-group">
+            <div className="header-range-group" ref={datePickerWrapRef}>
               <div className="segmented header-range-seg" role="group" aria-label="统计时间范围">
                 {(
                   [
-                    { id: 'today', label: '今日' },
-                    { id: '7d', label: '近 7 天' },
-                    { id: '30d', label: '近 30 天' },
-                    { id: 'all', label: '全部' }
+                    { id: 'today', label: '今日', compactLabel: '今日' },
+                    { id: '7d', label: '近 7 天', compactLabel: '7天' },
+                    { id: '30d', label: '近 30 天', compactLabel: '30天' },
+                    { id: 'all', label: '全部', compactLabel: '全部' }
                   ] as const
                 ).map((item) => (
                   <button
                     key={item.id}
                     type="button"
-                    className={`seg-btn ${!selectedDate && timeRange === item.id ? 'active' : ''}`}
+                    className={`seg-btn ${!selectedDate && !customRange && timeRange === item.id ? 'active' : ''}`}
                     onClick={() => handleSelectTimeRange(item.id)}
                   >
-                    {item.label}
+                    {isCompact ? item.compactLabel : item.label}
                   </button>
                 ))}
+                <button
+                  type="button"
+                  className={`seg-btn custom-range-btn ${customRange || showDatePicker ? 'active' : ''}`}
+                  aria-expanded={showDatePicker}
+                  onClick={handleToggleCustomPicker}
+                  title={
+                    customRange
+                      ? `自定义日期：${customRange.start} 至 ${customRange.end}`
+                      : '自选起始与结束日期（或单日）'
+                  }
+                >
+                  <CalendarDays size={12} />
+                  <span>{isCompact ? '自选' : '自定义'}</span>
+                </button>
               </div>
+
+              {showDatePicker && (
+                <div className="custom-date-popover" role="dialog" aria-label="自定义日期筛选">
+                  <div className="custom-date-presets">
+                    <button
+                      type="button"
+                      className="preset-pill"
+                      onClick={() => applyQuickCustomPreset('yesterday')}
+                    >
+                      昨天
+                    </button>
+                    <button
+                      type="button"
+                      className="preset-pill"
+                      onClick={() => applyQuickCustomPreset('this_week')}
+                    >
+                      本周
+                    </button>
+                    <button
+                      type="button"
+                      className="preset-pill"
+                      onClick={() => applyQuickCustomPreset('this_month')}
+                    >
+                      本月
+                    </button>
+                    <button
+                      type="button"
+                      className="preset-pill"
+                      onClick={() => applyQuickCustomPreset('last_month')}
+                    >
+                      上月
+                    </button>
+                  </div>
+
+                  <form
+                    className="custom-date-form"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      applyCustomDateRange(draftStart, draftEnd);
+                    }}
+                  >
+                    <div className="custom-date-inputs">
+                      <label className="custom-date-field" htmlFor="custom-date-start">
+                        <span>开始日期</span>
+                        <input
+                          id="custom-date-start"
+                          name="startDate"
+                          type="date"
+                          className="custom-date-input"
+                          value={draftStart}
+                          max={todayStr}
+                          onChange={(e) => setDraftStart(e.target.value)}
+                          required
+                        />
+                      </label>
+                      <span className="custom-date-sep">至</span>
+                      <label className="custom-date-field" htmlFor="custom-date-end">
+                        <span>结束日期</span>
+                        <input
+                          id="custom-date-end"
+                          name="endDate"
+                          type="date"
+                          className="custom-date-input"
+                          value={draftEnd}
+                          max={todayStr}
+                          onChange={(e) => setDraftEnd(e.target.value)}
+                          required
+                        />
+                      </label>
+                    </div>
+                    <div className="custom-date-actions">
+                      {customRange && (
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => handleSelectTimeRange('7d')}
+                        >
+                          重置近 7 天
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        onClick={() => setShowDatePicker(false)}
+                      >
+                        取消
+                      </button>
+                      <button type="submit" className="btn-primary-sm">
+                        应用
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -641,6 +1007,39 @@ export default function App() {
             open={showGuardSettings}
             onClose={() => setShowGuardSettings(false)}
           />
+
+          {customRange && (
+            <div className="workspace-active-banner">
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <CalendarDays size={13} />
+                <span>
+                  自定义日期：
+                  <strong className="mono">
+                    {customRange.start === customRange.end
+                      ? customRange.start
+                      : `${customRange.start} 至 ${customRange.end}`}
+                  </strong>
+                </span>
+              </div>
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={handleToggleCustomPicker}
+                >
+                  调整
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => handleSelectTimeRange('7d')}
+                >
+                  <X size={12} />
+                  <span>恢复近 7 天</span>
+                </button>
+              </div>
+            </div>
+          )}
 
           {selectedWorkspace && (
             <div className="workspace-active-banner">
@@ -847,7 +1246,10 @@ export default function App() {
               <TokenHeatmap
                 data={heatmap}
                 selectedDate={selectedDate}
-                onSelectDate={(d) => setSelectedDate(d)}
+                onSelectDate={(d) => {
+                  setCustomRange(null);
+                  setSelectedDate(d);
+                }}
               />
             </section>
           )}
@@ -857,6 +1259,7 @@ export default function App() {
               data={heatmap}
               selectedDate={selectedDate}
               onSelectDate={(d) => {
+                setCustomRange(null);
                 setSelectedDate(d);
                 if (d) setCompactTab('sessions');
               }}

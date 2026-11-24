@@ -11,13 +11,17 @@ import {
   CONVERSATIONS_DIR,
   SUMMARIES_DB_PATH,
   getContextLimitConfig,
+  getDashboardData,
   getHeatmapData,
   getOverviewData,
   getSessionAuditDetail,
   getSessionsList,
   getTodayTotalCostUsd,
   getWorkspaceBreakdown,
-  invalidateMasterIndexCache
+  invalidateMasterIndexCache,
+  markSessionDirty,
+  markSummariesDirty,
+  toLocalDateKey
 } from '../core/telemetry.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -104,14 +108,19 @@ function getRenderedIndexHtml() {
   return cachedInlinedHtml;
 }
 
-// --- SSE (Server-Sent Events) ---
+// --- Incremental Watchers, Version State & SSE ---
+const MAX_SSE_CLIENTS = 3;
 const sseClients = new Set();
 const watchers = [];
 let debounceTimer = null;
+let dataVersion = 1;
+let lastDataChangeAt = new Date().toISOString();
 
 function broadcastUpdate() {
-  invalidateMasterIndexCache();
-  const data = JSON.stringify({ type: 'update', timestamp: Date.now() });
+  dataVersion += 1;
+  lastDataChangeAt = new Date().toISOString();
+  if (sseClients.size === 0) return;
+  const data = JSON.stringify({ type: 'update', version: dataVersion, timestamp: Date.now() });
   for (const client of sseClients) {
     try {
       client.write(`data: ${data}\n\n`);
@@ -121,19 +130,51 @@ function broadcastUpdate() {
   }
 }
 
+const sseHeartbeatTimer = setInterval(() => {
+  if (sseClients.size === 0) return;
+  for (const client of sseClients) {
+    try {
+      client.write(': ping\n\n');
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}, 25000);
+if (typeof sseHeartbeatTimer.unref === 'function') sseHeartbeatTimer.unref();
+
 try {
   const triggerDebouncedBroadcast = () => {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
+      debounceTimer = null;
       broadcastUpdate();
-    }, 500);
+    }, 1200);
   };
 
   if (fs.existsSync(CONVERSATIONS_DIR)) {
-    watchers.push(fs.watch(CONVERSATIONS_DIR, triggerDebouncedBroadcast));
+    watchers.push(fs.watch(CONVERSATIONS_DIR, (_eventType, filename) => {
+      if (typeof filename === 'string' && filename) {
+        const m = filename.match(/^([a-zA-Z0-9_-]+)\.db(?:-(?:wal|shm|journal))?$/i);
+        if (!m) return;
+        markSessionDirty(m[1]);
+      } else {
+        invalidateMasterIndexCache();
+      }
+      triggerDebouncedBroadcast();
+    }));
   }
   if (fs.existsSync(SUMMARIES_DB_PATH)) {
-    watchers.push(fs.watch(SUMMARIES_DB_PATH, triggerDebouncedBroadcast));
+    watchers.push(fs.watch(SUMMARIES_DB_PATH, () => {
+      markSummariesDirty();
+      triggerDebouncedBroadcast();
+    }));
+  }
+  const summariesWalPath = `${SUMMARIES_DB_PATH}-wal`;
+  if (fs.existsSync(summariesWalPath)) {
+    watchers.push(fs.watch(summariesWalPath, () => {
+      markSummariesDirty();
+      triggerDebouncedBroadcast();
+    }));
   }
 } catch {
   console.error('[Anti Model Monitor] Filesystem watch unavailable, falling back to on-demand polling.');
@@ -242,15 +283,65 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // SSE endpoint
+  // Lightweight version probe endpoint (0 SQLite / disk reads)
+  if (pathname === '/api/version') {
+    sendJson(res, 200, {
+      version: dataVersion,
+      updatedAt: lastDataChangeAt,
+      dateKey: toLocalDateKey(Date.now())
+    });
+    return;
+  }
+
+  // Combined dashboard endpoint (1 computeWindowStats call for overview + sessions + optional heatmap)
+  if (pathname === '/api/dashboard') {
+    const range = urlObj.searchParams.get('range') || '7d';
+    const date = urlObj.searchParams.get('date') || null;
+    const startDate = urlObj.searchParams.get('start') || null;
+    const endDate = urlObj.searchParams.get('end') || null;
+    const focusConversationId = urlObj.searchParams.get('focusConversationId') || null;
+    const workspace = urlObj.searchParams.get('workspace') || null;
+    const search = urlObj.searchParams.get('search') || '';
+    const model = urlObj.searchParams.get('model') || '';
+    const type = urlObj.searchParams.get('type') || '';
+    const page = parseInt(urlObj.searchParams.get('page') || '1', 10);
+    const pageSize = parseInt(urlObj.searchParams.get('pageSize') || '500', 10);
+    const includeHeatmap = urlObj.searchParams.get('includeHeatmap') === '1';
+    sendJson(res, 200, {
+      version: dataVersion,
+      ...getDashboardData({
+        range,
+        date,
+        startDate,
+        endDate,
+        focusConversationId,
+        workspace,
+        search,
+        model,
+        type,
+        page,
+        pageSize,
+        includeHeatmap
+      })
+    });
+    return;
+  }
+
+  // SSE endpoint (capped and heartbeat-guarded for backward compatibility)
   if (pathname === '/api/events') {
+    while (sseClients.size >= MAX_SSE_CLIENTS) {
+      const oldest = sseClients.values().next().value;
+      if (!oldest) break;
+      sseClients.delete(oldest);
+      try { oldest.end(); } catch {}
+    }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive'
     });
     res.write('retry: 3000\n\n');
-    res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'connected', version: dataVersion })}\n\n`);
     sseClients.add(res);
 
     req.on('close', () => {
@@ -292,31 +383,37 @@ const server = http.createServer((req, res) => {
   if (pathname === '/api/workspaces') {
     const range = urlObj.searchParams.get('range') || '7d';
     const date = urlObj.searchParams.get('date') || null;
-    sendJson(res, 200, getWorkspaceBreakdown({ range, date }));
+    const startDate = urlObj.searchParams.get('start') || null;
+    const endDate = urlObj.searchParams.get('end') || null;
+    sendJson(res, 200, getWorkspaceBreakdown({ range, date, startDate, endDate }));
     return;
   }
 
-  // API: Global Overview (supports ?range=today|7d|30d|all, ?date=YYYY-MM-DD, ?focusConversationId=..., ?workspace=...)
+  // API: Global Overview (supports ?range=today|7d|30d|all, ?date=YYYY-MM-DD, ?start=...&end=..., ?focusConversationId=..., ?workspace=...)
   if (pathname === '/api/overview') {
     const range = urlObj.searchParams.get('range') || '7d';
     const date = urlObj.searchParams.get('date') || null;
+    const startDate = urlObj.searchParams.get('start') || null;
+    const endDate = urlObj.searchParams.get('end') || null;
     const focusConversationId = urlObj.searchParams.get('focusConversationId') || null;
     const workspace = urlObj.searchParams.get('workspace') || null;
-    sendJson(res, 200, getOverviewData({ range, date, focusConversationId, workspace }));
+    sendJson(res, 200, getOverviewData({ range, date, startDate, endDate, focusConversationId, workspace }));
     return;
   }
 
-  // API: Sessions List (supports range, date, workspace, search, model, type, pagination)
+  // API: Sessions List (supports range, date, start, end, workspace, search, model, type, pagination)
   if (pathname === '/api/sessions') {
     const range = urlObj.searchParams.get('range') || '7d';
     const date = urlObj.searchParams.get('date') || null;
+    const startDate = urlObj.searchParams.get('start') || null;
+    const endDate = urlObj.searchParams.get('end') || null;
     const workspace = urlObj.searchParams.get('workspace') || null;
     const search = urlObj.searchParams.get('search') || '';
     const model = urlObj.searchParams.get('model') || '';
     const type = urlObj.searchParams.get('type') || '';
     const page = parseInt(urlObj.searchParams.get('page') || '1', 10);
     const pageSize = parseInt(urlObj.searchParams.get('pageSize') || '500', 10);
-    sendJson(res, 200, getSessionsList({ range, date, workspace, search, model, type, page, pageSize }));
+    sendJson(res, 200, getSessionsList({ range, date, startDate, endDate, workspace, search, model, type, page, pageSize }));
     return;
   }
 
@@ -373,6 +470,7 @@ function gracefulShutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   if (debounceTimer) clearTimeout(debounceTimer);
+  clearInterval(sseHeartbeatTimer);
   for (const w of watchers) {
     try { w.close(); } catch {}
   }

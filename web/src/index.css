@@ -285,9 +285,105 @@ input:focus-visible,
 }
 
 .header-range-group {
+  position: relative;
   display: flex;
   align-items: center;
   flex-shrink: 0;
+}
+
+.custom-range-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.custom-date-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 60;
+  width: 340px;
+  max-width: calc(100vw - 24px);
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.custom-date-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.preset-pill {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  border-radius: 7px;
+  padding: 5px 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.preset-pill:hover {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--accent);
+}
+
+.custom-date-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.custom-date-inputs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: end;
+  gap: 8px;
+}
+
+.custom-date-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.custom-date-input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.custom-date-sep {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  padding-bottom: 7px;
+}
+
+.custom-date-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .live-dot-inline {
@@ -302,6 +398,11 @@ input:focus-visible,
 
 .live-dot-inline.offline {
   background: #ef4444;
+  box-shadow: none;
+}
+
+.live-dot-inline.idle {
+  background: #94a3b8;
   box-shadow: none;
 }
 
@@ -413,6 +514,12 @@ input:focus-visible,
   border-color: var(--offline-border);
 }
 
+.live-pill.idle {
+  background: var(--surface-subtle, rgba(148, 163, 184, 0.12));
+  color: var(--text-muted, #64748b);
+  border-color: var(--border);
+}
+
 .live-dot {
   width: 7px;
   height: 7px;
@@ -423,6 +530,11 @@ input:focus-visible,
 
 .live-pill.offline .live-dot {
   background: #ef4444;
+  box-shadow: none;
+}
+
+.live-pill.idle .live-dot {
+  background: #94a3b8;
   box-shadow: none;
 }
 
@@ -2597,13 +2709,21 @@ input:focus-visible,
 .app-shell.compact-mode .segmented.header-range-seg {
   width: 100%;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .app-shell.compact-mode .segmented.header-range-seg .seg-btn {
   width: 100%;
   justify-content: center;
-  padding: 5px 4px;
+  padding: 5px 3px;
+  font-size: 11.5px;
+}
+
+.app-shell.compact-mode .custom-date-popover {
+  left: 0;
+  right: 0;
+  width: 100%;
+  max-width: none;
 }
 
 .app-shell.compact-mode .brand-mark {

@@ -237,7 +237,7 @@ export interface SessionDetail extends SessionItem {
   generations: GenerationTurn[];
 }
 
-export type TimeRange = 'today' | '7d' | '30d' | 'all';
+export type TimeRange = 'today' | '7d' | '30d' | 'all' | 'custom';
 
 export function getModelColor(model: string): string {
   const m = (model || '').toLowerCase();
