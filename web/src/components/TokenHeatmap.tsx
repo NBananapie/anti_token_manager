@@ -1,9 +1,11 @@
 import React, { useMemo, useState } from 'react';
-import { CalendarDays, Clock, X } from 'lucide-react';
+import { BarChart3, CalendarDays, Clock, X } from 'lucide-react';
 import { HeatmapData, HeatmapDay, formatCompactTokens, formatUsd } from '../types';
 
-type HeatmapMode = 'calendar' | 'hourly';
+type HeatmapMode = 'calendar' | 'hourly' | 'bar';
 type HeatmapMetric = 'tokens' | 'costUsd' | 'calls';
+type BarMetric = 'all' | HeatmapMetric;
+type BarWindow = '14d' | '30d' | 'all';
 
 interface Props {
   data: HeatmapData | null;
@@ -24,12 +26,23 @@ const CAL_TOP = 17;
 const CAL_SVG_W = CAL_LEFT + CAL_WEEKS * CAL_PITCH - CAL_GAP + 4; // 499
 const CAL_SVG_H = CAL_TOP + 7 * CAL_PITCH - CAL_GAP + 4; // 116
 
-// Hourly matrix geometry (matched height for zero layout shift on tab switch)
-const HR_LEFT = 24;
-const HR_CELL_W = 16.5;
-const HR_GAP_X = 3;
-const HR_PITCH_X = HR_CELL_W + HR_GAP_X; // 19.5
-const HR_SVG_W = HR_LEFT + 24 * HR_PITCH_X - HR_GAP_X + 4; // 493
+// Strict 1:1 square 7x24 hourly matrix geometry (uniform horizontal & vertical gap)
+const HR_LEFT = 26;
+const HR_TOP = 17;
+const HR_CELL = 14;
+const HR_GAP = 3.5;
+const HR_PITCH = HR_CELL + HR_GAP; // 17.5
+const HR_SVG_W = HR_LEFT + 24 * HR_PITCH - HR_GAP + 4; // 446.5
+const HR_SVG_H = HR_TOP + 7 * HR_PITCH - HR_GAP + 4; // 139.5
+
+// Daily bar chart geometry
+const BAR_LEFT = 38;
+const BAR_RIGHT = 8;
+const BAR_TOP = 10;
+const BAR_BOTTOM = 18;
+const BAR_PLOT_H = 100;
+const BAR_SVG_H = BAR_TOP + BAR_PLOT_H + BAR_BOTTOM; // 128
+const BAR_BASE_W = CAL_SVG_W; // 499
 
 function pad2(n: number) {
   return String(n).padStart(2, '0');
@@ -37,6 +50,29 @@ function pad2(n: number) {
 
 function dateKeyFromDate(d: Date) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function computeNiceMax(rawMax: number): number {
+  if (!rawMax || rawMax <= 0) return 1;
+  const exp = Math.floor(Math.log10(rawMax));
+  const mag = 10 ** exp;
+  const norm = rawMax / mag;
+  const niceNorm = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10;
+  return niceNorm * mag;
+}
+
+function formatAxisTick(value: number, metric: HeatmapMetric): string {
+  if (value <= 0) return metric === 'costUsd' ? '$0' : '0';
+  if (metric === 'tokens') {
+    return formatCompactTokens(value).replace(/\.0+([KMB])$/, '$1');
+  }
+  if (metric === 'costUsd') {
+    if (value < 0.1) return `$${value.toFixed(2)}`;
+    if (value < 10) return `$${Number(value.toFixed(1))}`;
+    return `$${Math.round(value)}`;
+  }
+  if (value >= 1000) return `${Number((value / 1000).toFixed(1))}K`;
+  return String(Math.round(value));
 }
 
 function computeLevel(val: number, thresholds: [number, number, number]): 0 | 1 | 2 | 3 | 4 {
@@ -57,6 +93,8 @@ function buildThresholds(values: number[]): [number, number, number] {
 export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props) {
   const [mode, setMode] = useState<HeatmapMode>('calendar');
   const [metric, setMetric] = useState<HeatmapMetric>('tokens');
+  const [barMetric, setBarMetric] = useState<BarMetric>('all');
+  const [barWindow, setBarWindow] = useState<BarWindow>('30d');
   const [hoveredDay, setHoveredDay] = useState<{ date: string; rec?: HeatmapDay } | null>(null);
   const [hoveredHour, setHoveredHour] = useState<{
     dow: number;
@@ -142,20 +180,141 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
     return buildThresholds(vals);
   }, [data, metric]);
 
+  const barModel = useMemo(() => {
+    const today = new Date();
+    const todayNoon = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 12, 0, 0);
+    const endKey = dateKeyFromDate(todayNoon);
+    const endDate =
+      data?.maxDate && data.maxDate > endKey
+        ? new Date(`${data.maxDate}T12:00:00`)
+        : todayNoon;
+
+    let startDate: Date;
+    if (barWindow === '14d') {
+      startDate = new Date(endDate);
+      startDate.setDate(endDate.getDate() - 13);
+    } else if (barWindow === '30d') {
+      startDate = new Date(endDate);
+      startDate.setDate(endDate.getDate() - 29);
+    } else if (data?.minDate) {
+      startDate = new Date(`${data.minDate}T12:00:00`);
+    } else {
+      startDate = new Date(endDate);
+      startDate.setDate(endDate.getDate() - 29);
+    }
+
+    const items: {
+      date: string;
+      shortLabel: string;
+      tokens: number;
+      costUsd: number;
+      calls: number;
+      rec?: HeatmapDay;
+    }[] = [];
+    const cur = new Date(startDate);
+    while (cur.getTime() <= endDate.getTime()) {
+      const key = dateKeyFromDate(cur);
+      const rec = dayMap.get(key);
+      items.push({
+        date: key,
+        shortLabel: key.slice(5),
+        tokens: rec?.tokens || 0,
+        costUsd: rec?.costUsd || 0,
+        calls: rec?.calls || 0,
+        rec
+      });
+      cur.setDate(cur.getDate() + 1);
+    }
+
+    const peaks = {
+      tokens: items.reduce((mx, it) => Math.max(mx, it.tokens), 0),
+      costUsd: items.reduce((mx, it) => Math.max(mx, it.costUsd), 0),
+      calls: items.reduce((mx, it) => Math.max(mx, it.calls), 0)
+    };
+    const totals = {
+      tokens: items.reduce((s, it) => s + it.tokens, 0),
+      costUsd: items.reduce((s, it) => s + it.costUsd, 0),
+      calls: items.reduce((s, it) => s + it.calls, 0)
+    };
+
+    const singleMetric: HeatmapMetric = barMetric === 'all' ? 'tokens' : barMetric;
+    const rawMax = peaks[singleMetric];
+    const yMax = computeNiceMax(rawMax);
+
+    const minColPitch = barMetric === 'all' ? 12 : 6.5;
+    const minPlotW = Math.max(BAR_BASE_W - BAR_LEFT - BAR_RIGHT, items.length * minColPitch);
+    const svgW = BAR_LEFT + minPlotW + BAR_RIGHT;
+    const plotW = svgW - BAR_LEFT - BAR_RIGHT;
+    const colPitch = items.length > 0 ? plotW / items.length : plotW;
+    const barW = Math.max(2.5, Math.min(20, colPitch * 0.68));
+    const groupW = Math.max(5.5, Math.min(26, colPitch * 0.78));
+    const subGap = Math.max(0.7, Math.min(1.6, groupW * 0.08));
+    const subBarW = Math.max(1.5, (groupW - 2 * subGap) / 3);
+
+    // Pick evenly spaced non-overlapping X-axis tick indices
+    const maxTicks = Math.max(2, Math.floor(plotW / 62));
+    const step = Math.max(1, Math.ceil(items.length / maxTicks));
+    const tickIndices: number[] = [];
+    for (let i = 0; i < items.length; i += step) {
+      tickIndices.push(i);
+    }
+    const lastIdx = items.length - 1;
+    if (lastIdx > 0 && tickIndices[tickIndices.length - 1] !== lastIdx) {
+      if ((lastIdx - tickIndices[tickIndices.length - 1]) * colPitch < 34) {
+        tickIndices[tickIndices.length - 1] = lastIdx;
+      } else {
+        tickIndices.push(lastIdx);
+      }
+    }
+
+    return {
+      items,
+      peaks,
+      totals,
+      singleMetric,
+      yMax,
+      svgW,
+      plotW,
+      colPitch,
+      barW,
+      groupW,
+      subGap,
+      subBarW,
+      tickIndices
+    };
+  }, [barMetric, barWindow, data, dayMap]);
+
   const metricLabel = metric === 'tokens' ? 'Token' : metric === 'costUsd' ? '费用' : '调用';
+  const barWindowLabel = barWindow === '14d' ? '近 14 天' : barWindow === '30d' ? '近 30 天' : '全量';
+  const barSummaryText =
+    barMetric === 'all'
+      ? `${barWindowLabel} · 三指标同显`
+      : barMetric === 'tokens'
+        ? `${barWindowLabel} · 累计 ${formatCompactTokens(barModel.totals.tokens)}`
+        : barMetric === 'costUsd'
+          ? `${barWindowLabel} · 累计 ${formatUsd(barModel.totals.costUsd)}`
+          : `${barWindowLabel} · 累计 ${barModel.totals.calls.toLocaleString()} 次`;
 
   return (
     <section className="panel-card heatmap-card" aria-label="Token 消耗热力图">
       <div className="panel-header" style={{ marginBottom: 10 }}>
         <div className="panel-title-wrap">
           <h2 className="panel-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-            {mode === 'calendar' ? <CalendarDays size={15} /> : <Clock size={15} />}
+            {mode === 'calendar' ? (
+              <CalendarDays size={15} />
+            ) : mode === 'bar' ? (
+              <BarChart3 size={15} />
+            ) : (
+              <Clock size={15} />
+            )}
             Token 消耗热力图
           </h2>
           <span className="panel-meta">
             {mode === 'calendar'
               ? `近 ${CAL_WEEKS} 周 · 活跃 ${calendarModel.activeDays} 天 · 点击日期筛选`
-              : '全历史星期 × 24 小时活跃分布'}
+              : mode === 'bar'
+                ? barSummaryText
+                : '全历史星期 × 24 小时活跃分布'}
           </span>
         </div>
 
@@ -173,22 +332,39 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
           )}
 
           <div className="segmented" role="group" aria-label="热力图指标">
+            {mode === 'bar' && (
+              <button
+                type="button"
+                className={`seg-btn ${barMetric === 'all' ? 'active' : ''}`}
+                onClick={() => setBarMetric('all')}
+              >
+                全部
+              </button>
+            )}
             {(
               [
                 { id: 'tokens', label: 'Token' },
                 { id: 'costUsd', label: '费用' },
                 { id: 'calls', label: '调用' }
               ] as const
-            ).map((m) => (
-              <button
-                key={m.id}
-                type="button"
-                className={`seg-btn ${metric === m.id ? 'active' : ''}`}
-                onClick={() => setMetric(m.id)}
-              >
-                {m.label}
-              </button>
-            ))}
+            ).map((m) => {
+              const isActive = mode === 'bar' ? barMetric === m.id : metric === m.id;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  className={`seg-btn ${isActive ? 'active' : ''}`}
+                  onClick={() => {
+                    if (mode === 'bar') {
+                      setBarMetric(m.id);
+                    }
+                    setMetric(m.id);
+                  }}
+                >
+                  {m.label}
+                </button>
+              );
+            })}
           </div>
 
           <div className="segmented" role="group" aria-label="热力图视图">
@@ -201,6 +377,13 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
             </button>
             <button
               type="button"
+              className={`seg-btn ${mode === 'bar' ? 'active' : ''}`}
+              onClick={() => setMode('bar')}
+            >
+              柱状图
+            </button>
+            <button
+              type="button"
               className={`seg-btn ${mode === 'hourly' ? 'active' : ''}`}
               onClick={() => setMode('hourly')}
             >
@@ -210,7 +393,7 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
         </div>
       </div>
 
-      {/* Heatmap Canvas: Strict 1:1 Square Cells & Equal 3px Row/Col Gaps */}
+      {/* Visualization Canvas */}
       {mode === 'calendar' ? (
         <div className="heatmap-scroll">
           <svg
@@ -284,11 +467,224 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
             )}
           </svg>
         </div>
+      ) : mode === 'bar' ? (
+        <div className="hm-bar-wrap">
+          {barMetric === 'all' && (
+            <div className="hm-bar-legend" aria-label="柱状图指标图例（各指标按各自窗口峰值归一化）">
+              <button
+                type="button"
+                className="hm-bar-legend-item"
+                onClick={() => {
+                  setBarMetric('tokens');
+                  setMetric('tokens');
+                }}
+                title="点击单独查看 Token 绝对值"
+              >
+                <span className="hm-bar-dot tokens" />
+                <span>Token</span>
+                <span className="hm-bar-peak mono">峰值 {formatCompactTokens(barModel.peaks.tokens)}</span>
+              </button>
+              <button
+                type="button"
+                className="hm-bar-legend-item"
+                onClick={() => {
+                  setBarMetric('costUsd');
+                  setMetric('costUsd');
+                }}
+                title="点击单独查看费用绝对值"
+              >
+                <span className="hm-bar-dot costUsd" />
+                <span>费用</span>
+                <span className="hm-bar-peak mono">峰值 {formatUsd(barModel.peaks.costUsd)}</span>
+              </button>
+              <button
+                type="button"
+                className="hm-bar-legend-item"
+                onClick={() => {
+                  setBarMetric('calls');
+                  setMetric('calls');
+                }}
+                title="点击单独查看调用次数绝对值"
+              >
+                <span className="hm-bar-dot calls" />
+                <span>调用</span>
+                <span className="hm-bar-peak mono">峰值 {barModel.peaks.calls.toLocaleString()}</span>
+              </button>
+              <span className="hm-bar-norm-hint">各指标按自身峰值归一化</span>
+            </div>
+          )}
+
+          <div className="heatmap-scroll">
+            <svg
+              viewBox={`0 0 ${barModel.svgW} ${BAR_SVG_H}`}
+              className="heatmap-svg heatmap-bar-svg"
+              style={barModel.svgW > BAR_BASE_W ? { minWidth: `${barModel.svgW}px` } : undefined}
+              preserveAspectRatio="xMidYMid meet"
+              role="img"
+              aria-label={
+                barMetric === 'all'
+                  ? '按天 Token、费用与调用三指标对比柱状图'
+                  : `按天 ${barMetric === 'tokens' ? 'Token' : barMetric === 'costUsd' ? '费用' : '调用'} 消耗柱状图`
+              }
+            >
+              {/* Horizontal gridlines & Y-axis labels */}
+              {[0, 0.5, 1].map((ratio) => {
+                const y = BAR_TOP + BAR_PLOT_H * (1 - ratio);
+                const label =
+                  barMetric === 'all'
+                    ? `${Math.round(ratio * 100)}%`
+                    : formatAxisTick(barModel.yMax * ratio, barModel.singleMetric);
+                return (
+                  <g key={`y-${ratio}`}>
+                    <line
+                      x1={BAR_LEFT}
+                      y1={y}
+                      x2={barModel.svgW - BAR_RIGHT}
+                      y2={y}
+                      className={`hm-bar-grid ${ratio === 0 ? 'baseline' : ''}`}
+                    />
+                    <text
+                      x={BAR_LEFT - 5}
+                      y={y + 3}
+                      textAnchor="end"
+                      className="hm-axis-label hm-bar-y-label"
+                    >
+                      {label}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* X-axis date ticks */}
+              {barModel.tickIndices.map((idx) => {
+                const item = barModel.items[idx];
+                if (!item) return null;
+                const cx = BAR_LEFT + (idx + 0.5) * barModel.colPitch;
+                const anchor = idx === 0 ? 'start' : idx === barModel.items.length - 1 ? 'end' : 'middle';
+                const tx =
+                  idx === 0
+                    ? Math.max(BAR_LEFT, cx - barModel.groupW / 2)
+                    : idx === barModel.items.length - 1
+                      ? Math.min(barModel.svgW - BAR_RIGHT, cx + barModel.groupW / 2)
+                      : cx;
+                return (
+                  <text
+                    key={`xt-${item.date}`}
+                    x={tx}
+                    y={BAR_TOP + BAR_PLOT_H + 12}
+                    textAnchor={anchor}
+                    className="hm-axis-label hm-bar-x-label"
+                  >
+                    {item.shortLabel}
+                  </text>
+                );
+              })}
+
+              {/* Bars + full-column hit targets */}
+              {barModel.items.map((item, idx) => {
+                const colX = BAR_LEFT + idx * barModel.colPitch;
+                const isSelected = selectedDate === item.date;
+                const isHovered = hoveredDay?.date === item.date;
+                const isDimmed = Boolean(selectedDate && !isSelected && !isHovered);
+                const clickable = Boolean(item.rec);
+                const groupX = colX + (barModel.colPitch - barModel.groupW) / 2;
+
+                return (
+                  <g
+                    key={item.date}
+                    className={`hm-bar-col ${clickable ? 'clickable' : ''} ${isSelected ? 'selected' : ''} ${isHovered ? 'hovered' : ''} ${isDimmed ? 'dimmed' : ''}`}
+                    onMouseEnter={() => setHoveredDay({ date: item.date, rec: item.rec })}
+                    onMouseLeave={() => setHoveredDay(null)}
+                    onClick={() => {
+                      if (selectedDate === item.date) {
+                        onSelectDate(null);
+                      } else if (item.rec) {
+                        onSelectDate(item.date);
+                      }
+                    }}
+                  >
+                    <title>
+                      {item.rec
+                        ? `${item.date} · ${formatCompactTokens(item.rec.tokens)} tokens · ${formatUsd(item.rec.costUsd)} · ${item.rec.calls} 次 (${item.rec.sessions} 会话)`
+                        : `${item.date} · 无记录`}
+                    </title>
+                    <rect
+                      x={colX}
+                      y={BAR_TOP}
+                      width={barModel.colPitch}
+                      height={BAR_PLOT_H}
+                      rx={2}
+                      className="hm-bar-hit"
+                    />
+                    {barMetric === 'all' ? (
+                      <>
+                        {(['tokens', 'costUsd', 'calls'] as const).map((seriesKey, si) => {
+                          const val = item[seriesKey];
+                          const peak = barModel.peaks[seriesKey];
+                          const rawH = peak > 0 ? (val / peak) * BAR_PLOT_H : 0;
+                          const h = val > 0 ? Math.max(2, rawH) : 0;
+                          const bx = groupX + si * (barModel.subBarW + barModel.subGap);
+                          const by = BAR_TOP + BAR_PLOT_H - h;
+                          return h > 0 ? (
+                            <rect
+                              key={seriesKey}
+                              x={bx}
+                              y={by}
+                              width={barModel.subBarW}
+                              height={h}
+                              rx={Math.min(1.6, barModel.subBarW / 2)}
+                              className={`hm-bar-rect metric-${seriesKey} ${isSelected ? 'selected' : ''}`}
+                            />
+                          ) : (
+                            <line
+                              key={seriesKey}
+                              x1={bx}
+                              y1={BAR_TOP + BAR_PLOT_H - 0.5}
+                              x2={bx + barModel.subBarW}
+                              y2={BAR_TOP + BAR_PLOT_H - 0.5}
+                              className="hm-bar-zero-tick"
+                            />
+                          );
+                        })}
+                      </>
+                    ) : (
+                      (() => {
+                        const val = item[barModel.singleMetric];
+                        const rawH = barModel.yMax > 0 ? (val / barModel.yMax) * BAR_PLOT_H : 0;
+                        const barH = val > 0 ? Math.max(2.5, rawH) : 0;
+                        const barX = colX + (barModel.colPitch - barModel.barW) / 2;
+                        const barY = BAR_TOP + BAR_PLOT_H - barH;
+                        return barH > 0 ? (
+                          <rect
+                            x={barX}
+                            y={barY}
+                            width={barModel.barW}
+                            height={barH}
+                            rx={Math.min(2.5, barModel.barW / 2)}
+                            className={`hm-bar-rect metric-${barModel.singleMetric} ${isSelected ? 'selected' : ''}`}
+                          />
+                        ) : (
+                          <line
+                            x1={barX}
+                            y1={BAR_TOP + BAR_PLOT_H - 0.5}
+                            x2={barX + barModel.barW}
+                            y2={BAR_TOP + BAR_PLOT_H - 0.5}
+                            className="hm-bar-zero-tick"
+                          />
+                        );
+                      })()
+                    )}
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+        </div>
       ) : (
         <div className="heatmap-scroll">
           <svg
-            viewBox={`0 0 ${HR_SVG_W} ${CAL_SVG_H}`}
-            className="heatmap-svg"
+            viewBox={`0 0 ${HR_SVG_W} ${HR_SVG_H}`}
+            className="heatmap-svg hourly"
             preserveAspectRatio="xMidYMid meet"
             role="img"
             aria-label={`星期与 24 小时 ${metricLabel} 热力矩阵`}
@@ -296,16 +692,21 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
             {[0, 3, 6, 9, 12, 15, 18, 21].map((h) => (
               <text
                 key={`h-${h}`}
-                x={HR_LEFT + h * HR_PITCH_X}
+                x={HR_LEFT + h * HR_PITCH}
                 y={10}
-                className="hm-axis-label"
+                className="hm-axis-label hm-hourly-label"
               >
                 {pad2(h)}
               </text>
             ))}
 
             {WEEKDAY_LABELS.map((lbl, di) => (
-              <text key={`wd-${di}`} x={0} y={CAL_TOP + di * CAL_PITCH + 8.5} className="hm-axis-label">
+              <text
+                key={`wd-${di}`}
+                x={0}
+                y={HR_TOP + di * HR_PITCH + HR_CELL * 0.74}
+                className="hm-axis-label hm-hourly-label"
+              >
                 周{lbl}
               </text>
             ))}
@@ -316,11 +717,11 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
                 return (
                   <rect
                     key={`${dow}-${hr}`}
-                    x={HR_LEFT + hr * HR_PITCH_X}
-                    y={CAL_TOP + dow * CAL_PITCH}
-                    width={HR_CELL_W}
-                    height={CAL_CELL}
-                    rx={2.4}
+                    x={HR_LEFT + hr * HR_PITCH}
+                    y={HR_TOP + dow * HR_PITCH}
+                    width={HR_CELL}
+                    height={HR_CELL}
+                    rx={2.6}
                     className={`hm-cell lv-${level}`}
                     onMouseEnter={() => setHoveredHour({ dow, hour: hr, ...cell })}
                     onMouseLeave={() => setHoveredHour(null)}
@@ -336,10 +737,10 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
         </div>
       )}
 
-      {/* Telemetry Readout Footer + Scale Legend */}
+      {/* Telemetry Readout Footer + Scale Legend / Bar Window Switcher */}
       <div className="hm-footer">
         <div className="hm-readout">
-          {mode === 'calendar' && hoveredDay ? (
+          {(mode === 'calendar' || mode === 'bar') && hoveredDay ? (
             hoveredDay.rec ? (
               <>
                 <strong className="mono">{hoveredDay.date}</strong>
@@ -368,21 +769,42 @@ export default function TokenHeatmap({ data, selectedDate, onSelectDate }: Props
           ) : (
             <span>
               {data?.minDate && data?.maxDate
-                ? `全量记录范围 ${data.minDate} 至 ${data.maxDate} · 悬停查看单格明细`
+                ? `全量记录范围 ${data.minDate} 至 ${data.maxDate} · 悬停查看${mode === 'bar' ? '单日' : '单格'}明细`
                 : '正在聚合本地历史记录...'}
             </span>
           )}
         </div>
 
-        <div className="hm-legend" aria-hidden="true">
-          <span>少</span>
-          <span className="hm-swatch lv-0" />
-          <span className="hm-swatch lv-1" />
-          <span className="hm-swatch lv-2" />
-          <span className="hm-swatch lv-3" />
-          <span className="hm-swatch lv-4" />
-          <span>多</span>
-        </div>
+        {mode === 'bar' ? (
+          <div className="segmented hm-bar-window-seg" role="group" aria-label="柱状图时间跨度">
+            {(
+              [
+                { id: '14d', label: '14天' },
+                { id: '30d', label: '30天' },
+                { id: 'all', label: '全量' }
+              ] as const
+            ).map((w) => (
+              <button
+                key={w.id}
+                type="button"
+                className={`seg-btn ${barWindow === w.id ? 'active' : ''}`}
+                onClick={() => setBarWindow(w.id)}
+              >
+                {w.label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="hm-legend" aria-hidden="true">
+            <span>少</span>
+            <span className="hm-swatch lv-0" />
+            <span className="hm-swatch lv-1" />
+            <span className="hm-swatch lv-2" />
+            <span className="hm-swatch lv-3" />
+            <span className="hm-swatch lv-4" />
+            <span>多</span>
+          </div>
+        )}
       </div>
     </section>
   );
