@@ -100,13 +100,14 @@ async function verifySidecarServer() {
     }
     assert.ok(healthy, 'Sidecar HTTP 服务未能在超时内启动');
 
-    const [htmlRes, ovRes, hmRes, sessRes, wsRes, guardRes] = await Promise.all([
+    const [htmlRes, ovRes, hmRes, sessRes, wsRes, guardRes, quotaRes] = await Promise.all([
       fetch(`http://127.0.0.1:${port}/`),
       fetch(`http://127.0.0.1:${port}/api/overview?range=7d`),
       fetch(`http://127.0.0.1:${port}/api/heatmap`),
       fetch(`http://127.0.0.1:${port}/api/sessions?range=7d&pageSize=10`),
       fetch(`http://127.0.0.1:${port}/api/workspaces?range=7d`),
-      fetch(`http://127.0.0.1:${port}/api/guard-settings`)
+      fetch(`http://127.0.0.1:${port}/api/guard-settings`),
+      fetch(`http://127.0.0.1:${port}/api/quota`)
     ]);
     assert.equal(htmlRes.status, 200);
     assert.equal(ovRes.status, 200);
@@ -114,10 +115,16 @@ async function verifySidecarServer() {
     assert.equal(sessRes.status, 200);
     assert.equal(wsRes.status, 200);
     assert.equal(guardRes.status, 200);
+    assert.equal(quotaRes.status, 200);
 
     const overview = await ovRes.json();
     assert.ok(overview.contextConfig && typeof overview.contextConfig.effectiveLimit === 'number');
     assert.ok(Array.isArray(overview.workspaceBreakdown));
+    assert.ok(typeof overview.totalCacheAnomalies === 'number');
+
+    const quota = await quotaRes.json();
+    assert.ok(typeof quota.available === 'boolean');
+    assert.ok(Array.isArray(quota.groups));
 
     // Verify SSE handshake
     const sseController = new AbortController();
@@ -190,13 +197,18 @@ async function verifyMcpServer() {
 
     const list = await rpc(2, 'tools/list', {});
     const toolNames = list.result.tools.map((t) => t.name);
+    for (const name of toolNames) {
+      const fullName = `mcp_antigravity-token-manager_telemetry_${name}`;
+      assert.ok(fullName.length <= 64, `MCP 完整工具名超过 64 字符上限 (${fullName.length}): ${fullName}`);
+      assert.match(fullName, /^[a-zA-Z_][a-zA-Z0-9_-]*$/, `MCP 完整工具名含非法字符: ${fullName}`);
+    }
     for (const expected of [
       'token_get_overview',
       'token_get_session_audit',
       'token_get_context_limit',
       'token_get_daily_report',
-      'token_get_workspace_breakdown',
       'token_find_heavy_steps',
+      'token_get_quota',
       'token_get_guard_settings',
       'token_set_guard_config'
     ]) {
@@ -212,17 +224,21 @@ async function verifyMcpServer() {
     assert.equal(ovRes.result.isError, false);
     const ovPayload = JSON.parse(ovRes.result.content[0].text);
     assert.ok(typeof ovPayload.totalCalls === 'number');
+    assert.ok(Array.isArray(ovPayload.workspaceBreakdown));
 
     const reportRes = await rpc(5, 'tools/call', { name: 'token_get_daily_report', arguments: { weekly: true } });
     assert.equal(reportRes.result.isError, false);
-
-    const wsRes = await rpc(6, 'tools/call', { name: 'token_get_workspace_breakdown', arguments: { range: '7d' } });
-    assert.equal(wsRes.result.isError, false);
-    const wsPayload = JSON.parse(wsRes.result.content[0].text);
-    assert.ok(Array.isArray(wsPayload.workspaces));
+    const reportPayload = JSON.parse(reportRes.result.content[0].text);
+    assert.ok(Array.isArray(reportPayload.workspaceBreakdown));
 
     const guardRes = await rpc(7, 'tools/call', { name: 'token_get_guard_settings', arguments: {} });
     assert.equal(guardRes.result.isError, false);
+
+    const quotaMcpRes = await rpc(10, 'tools/call', { name: 'token_get_quota', arguments: {} });
+    assert.equal(quotaMcpRes.result.isError, false);
+    const quotaMcpPayload = JSON.parse(quotaMcpRes.result.content[0].text);
+    assert.ok(typeof quotaMcpPayload.available === 'boolean');
+    assert.ok(Array.isArray(quotaMcpPayload.groups));
 
     let auditedId = null;
     if (ovPayload.activeSessions && ovPayload.activeSessions.length > 0) {
@@ -243,7 +259,7 @@ async function verifyMcpServer() {
       assert.equal(heavyRes.result.isError, false);
     }
 
-    console.log(`[PASS] 3/4 MCP Stdio 8 工具全链路校验通过 (sessions=${ovPayload.totalSessions}, workspaces=${wsPayload.workspaces.length}, audited=${auditedId ? auditedId.slice(0, 8) : 'none'})`);
+    console.log(`[PASS] 3/4 MCP Stdio ${toolNames.length} 工具全链路校验通过 (sessions=${ovPayload.totalSessions}, workspaces=${ovPayload.workspaceBreakdown.length}, audited=${auditedId ? auditedId.slice(0, 8) : 'none'})`);
   } finally {
     child.stdin.end();
     child.kill('SIGTERM');

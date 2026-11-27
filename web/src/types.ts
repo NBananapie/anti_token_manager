@@ -13,6 +13,56 @@ export interface ContextLimitConfig {
   label: string;
 }
 
+export interface CacheAnomaly {
+  kind: 'cleared' | 'dropped' | 'missed';
+  stepIndex: number;
+  timestampMs: number;
+  model: string;
+  gapSec: number;
+  prevStepIndex: number;
+  prevHitPct: number;
+  curHitPct: number;
+  prevCacheTokens: number;
+  curCacheTokens: number;
+  contextTokens: number;
+  wastedCostUsd: number;
+}
+
+export interface QuotaWindow {
+  available: boolean;
+  bucketId: string | null;
+  remainingFraction: number | null;
+  remainingPct: number | null;
+  resetAt: string | null;
+  resetInSec: number | null;
+  expired: boolean;
+  disabled: boolean;
+  description: string;
+}
+
+export interface QuotaPoolGroup {
+  id: string;
+  poolKey: 'gemini' | 'argon' | 'claude' | 'other';
+  name: string;
+  rawName: string;
+  description: string;
+  windows: {
+    '5h': QuotaWindow;
+    weekly: QuotaWindow;
+  };
+}
+
+export interface QuotaSnapshot {
+  available: boolean;
+  status: 'live' | 'stale' | 'offline';
+  source: 'sidecar-env' | 'daemon-file' | 'cache' | 'none';
+  lsVersion: string | null;
+  planName: string | null;
+  groups: QuotaPoolGroup[];
+  fetchedAt: string | null;
+  error: string | null;
+}
+
 export interface ActiveSessionSnapshot {
   conversation_id: string;
   title: string;
@@ -23,6 +73,8 @@ export interface ActiveSessionSnapshot {
   lastCacheReadTokens: number;
   peakContextTokens: number;
   compactionCount: number;
+  cacheAnomalyCount?: number;
+  cacheAnomalyWastedUsd?: number;
   totalCalls: number;
   estimatedCostUsd: number;
   cacheSavingsUsd: number;
@@ -93,6 +145,8 @@ export interface GlobalOverview {
   totalCacheSavingsUsd: number;
   cacheSavingsPct: number;
   totalCompactions: number;
+  totalCacheAnomalies?: number;
+  totalCacheAnomalyWastedUsd?: number;
   globalSpeed: SpeedMetrics;
   typeCounts: {
     main: number;
@@ -161,6 +215,8 @@ export interface SessionItem {
   currentContextTokens: number;
   peakContextTokens: number;
   compactionCount: number;
+  cacheAnomalyCount?: number;
+  cacheAnomalyWastedUsd?: number;
   estimatedCostUsd: number;
   cacheSavingsUsd: number;
   avgTtftSec: number | null;
@@ -219,6 +275,7 @@ export interface GenerationTurn {
   e2eTps: number | null;
   deltaContextTokens?: number;
   isPostCompaction?: boolean;
+  cacheAnomaly?: CacheAnomaly;
   bloatTools?: ToolAttribution[];
   calledTools?: ToolAttribution[];
   metadata: Record<string, string>;
@@ -230,6 +287,7 @@ export interface SessionDetail extends SessionItem {
   lastTimestampMs: number;
   cacheSavingsPct: number;
   checkpoints: CheckpointEvent[];
+  cacheAnomalies?: CacheAnomaly[];
   heavySteps?: HeavyStepSummary[];
   childSessions: ChildSessionSummary[];
   parentSession: { conversation_id: string; title: string } | null;
@@ -333,6 +391,31 @@ export function getContextHealthClass(pct: number): 'ok' | 'warn' | 'danger' {
   if (pct >= 85) return 'danger';
   if (pct >= 65) return 'warn';
   return 'ok';
+}
+
+export function getQuotaHealthClass(remainingPct: number | null): 'ok' | 'warn' | 'danger' {
+  if (remainingPct == null) return 'ok';
+  if (remainingPct <= 20) return 'danger';
+  if (remainingPct <= 50) return 'warn';
+  return 'ok';
+}
+
+export function formatCountdownSec(totalSec: number | null): string {
+  if (totalSec == null || !Number.isFinite(totalSec)) return '-';
+  const s = Math.max(0, Math.round(totalSec));
+  if (s < 60) return '<1分钟';
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s % 86400) / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  if (days > 0) return hours > 0 ? `${days}天${hours}小时` : `${days}天`;
+  if (hours > 0) return mins > 0 ? `${hours}小时${mins}分` : `${hours}小时`;
+  return `${mins}分钟`;
+}
+
+export function getCacheAnomalyLabel(kind: CacheAnomaly['kind']): string {
+  if (kind === 'cleared') return '缓存清零';
+  if (kind === 'dropped') return '命中骤降';
+  return '缓存未命中';
 }
 
 // Deterministic, irreversible privacy masking helpers (zero original text leakage)

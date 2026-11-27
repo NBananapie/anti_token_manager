@@ -26,6 +26,7 @@ import {
 import {
   GlobalOverview,
   HeatmapData,
+  QuotaSnapshot,
   SessionDetail,
   SessionItem,
   TimeRange,
@@ -45,6 +46,7 @@ import TokenHeatmap from './components/TokenHeatmap';
 import SessionDetailPage from './components/SessionDetailPage';
 import ModelBadge from './components/ModelBadge';
 import GuardSettingsDrawer from './components/GuardSettingsDrawer';
+import QuotaPanel from './components/QuotaPanel';
 import {
   apiFetch,
   canJumpHostConversation,
@@ -91,6 +93,8 @@ export default function App() {
   const [overview, setOverview] = useState<GlobalOverview | null>(null);
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [heatmap, setHeatmap] = useState<HeatmapData | null>(null);
+  const [quota, setQuota] = useState<QuotaSnapshot | null>(null);
+  const [quotaRefreshing, setQuotaRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [isPaneActive, setIsPaneActive] = useState<boolean>(() => isPaneVisibleNow());
@@ -488,8 +492,34 @@ export default function App() {
     };
   }, [isPaneActive, probeServerVersion]);
 
+  const fetchQuota = useCallback(async (force = false) => {
+    try {
+      setQuotaRefreshing(true);
+      const res = await apiFetch(force ? './api/quota?force=1' : './api/quota');
+      if (res.ok) {
+        const data: QuotaSnapshot = await res.json();
+        setQuota(data);
+      }
+    } catch {
+      // Keep previous quota snapshot on transient network hiccups
+    } finally {
+      setQuotaRefreshing(false);
+    }
+  }, []);
+
+  // Poll local read-only quota only when pane is visible (60s cadence)
+  useEffect(() => {
+    if (!isPaneActive) return;
+    void fetchQuota(false);
+    const timer = window.setInterval(() => {
+      void fetchQuota(false);
+    }, 60000);
+    return () => window.clearInterval(timer);
+  }, [isPaneActive, fetchQuota]);
+
   const handleManualRefresh = () => {
     fetchDashboardData(timeRange, selectedDate, true, selectedWorkspace, customRange);
+    void fetchQuota(true);
     if (activeSessionId) fetchSessionDetail(activeSessionId, false);
   };
 
@@ -1090,19 +1120,27 @@ export default function App() {
             </nav>
           )}
 
-          {/* In compact sidecar mode, prioritize Live Context Monitor at the very top */}
+          {/* In compact sidecar mode, prioritize Live Context Monitor & Quota at the very top */}
           {isCompact && compactTab === 'live' && (
-            <ContextMonitorCard
-              activeSessions={overview?.activeSessions || []}
-              contextConfig={overview?.contextConfig}
-              privacyMode={privacyMode}
-              compact={true}
-              hostConversationId={hostConversationId}
-              followHost={followHost}
-              onSelectSession={(id) => setFollowHost(Boolean(hostConversationId && id === hostConversationId))}
-              onFollowHost={() => setFollowHost(true)}
-              onOpenSession={openSession}
-            />
+            <>
+              <ContextMonitorCard
+                activeSessions={overview?.activeSessions || []}
+                contextConfig={overview?.contextConfig}
+                privacyMode={privacyMode}
+                compact={true}
+                hostConversationId={hostConversationId}
+                followHost={followHost}
+                onSelectSession={(id) => setFollowHost(Boolean(hostConversationId && id === hostConversationId))}
+                onFollowHost={() => setFollowHost(true)}
+                onOpenSession={openSession}
+              />
+              <QuotaPanel
+                quota={quota}
+                refreshing={quotaRefreshing}
+                compact={true}
+                onRefresh={() => void fetchQuota(true)}
+              />
+            </>
           )}
 
           {/* 4 Balanced KPI Cards */}
@@ -1112,9 +1150,18 @@ export default function App() {
             <article className="kpi-card">
               <div className="kpi-top">
                 <span className="kpi-label">{isCompact ? 'Token 与缓存' : '周期 Token 流转与缓存效率'}</span>
-                <span className="kpi-icon" aria-hidden="true">
-                  <Layers size={15} />
-                </span>
+                {(overview?.totalCacheAnomalies ?? 0) > 0 ? (
+                  <span
+                    className="anomaly-pill"
+                    title={`短间隔（≤3分钟）异常掉缓存 ${overview?.totalCacheAnomalies} 次（已排除冷启动、切换模型与上下文压缩），估算多花 ${formatUsd(overview?.totalCacheAnomalyWastedUsd)}`}
+                  >
+                    {overview?.totalCacheAnomalies} 次掉缓存
+                  </span>
+                ) : (
+                  <span className="kpi-icon" aria-hidden="true">
+                    <Layers size={15} />
+                  </span>
+                )}
               </div>
               <div className="kpi-value-row">
                 <span
@@ -1228,6 +1275,16 @@ export default function App() {
               </div>
             </article>
           </section>
+          )}
+
+          {/* Account Real Quota Remaining (5h / Weekly) */}
+          {!isCompact && (
+            <QuotaPanel
+              quota={quota}
+              refreshing={quotaRefreshing}
+              compact={false}
+              onRefresh={() => void fetchQuota(true)}
+            />
           )}
 
           {/* Dual Telemetry Deck: Live Context Monitor (5/12) + Token Heatmap (7/12) */}
@@ -1703,6 +1760,14 @@ export default function App() {
                           {session.compactionCount > 0 && (
                             <span className="cp-mini-badge">{session.compactionCount} 压</span>
                           )}
+                          {(session.cacheAnomalyCount ?? 0) > 0 && (
+                            <span
+                              className="anomaly-mini-badge"
+                              title={`短间隔异常掉缓存 ${session.cacheAnomalyCount} 次，估算多花 ${formatUsd(session.cacheAnomalyWastedUsd)}`}
+                            >
+                              {session.cacheAnomalyCount} 掉缓存
+                            </span>
+                          )}
                         </div>
                         <div className="table-ctx-bar" aria-hidden="true">
                           <div
@@ -1874,6 +1939,14 @@ export default function App() {
                                 </span>
                                 {session.compactionCount > 0 && (
                                   <span className="cp-mini-badge">{session.compactionCount} 压</span>
+                                )}
+                                {(session.cacheAnomalyCount ?? 0) > 0 && (
+                                  <span
+                                    className="anomaly-mini-badge"
+                                    title={`短间隔异常掉缓存 ${session.cacheAnomalyCount} 次，估算多花 ${formatUsd(session.cacheAnomalyWastedUsd)}`}
+                                  >
+                                    {session.cacheAnomalyCount} 掉缓存
+                                  </span>
                                 )}
                               </div>
                               <div className="table-ctx-bar" aria-hidden="true">

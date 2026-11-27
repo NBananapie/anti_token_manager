@@ -13,7 +13,8 @@ import {
   TrendingUp,
   ExternalLink,
   Flame,
-  Wrench
+  Wrench,
+  AlertTriangle
 } from 'lucide-react';
 import {
   CheckpointEvent,
@@ -23,6 +24,7 @@ import {
   formatShortDateTime,
   formatTimeHms,
   formatUsd,
+  getCacheAnomalyLabel,
   getContextHealthClass,
   maskSessionId,
   maskSessionTitle
@@ -40,7 +42,7 @@ interface Props {
 }
 
 type ChartView = 'context' | 'latency';
-type TurnFilter = 'all' | 'checkpoint' | 'bloat' | 'slow';
+type TurnFilter = 'all' | 'checkpoint' | 'anomaly' | 'bloat' | 'slow';
 
 function formatBytesShort(bytes?: number): string {
   if (!bytes || bytes <= 0) return '';
@@ -140,6 +142,9 @@ export default function SessionDetailPage({
   const filteredTurns = useMemo(() => {
     if (turnFilter === 'checkpoint') {
       return orderedTurns.filter((t) => cpStepSet.has(t.stepIndex));
+    }
+    if (turnFilter === 'anomaly') {
+      return orderedTurns.filter((t) => Boolean(t.cacheAnomaly));
     }
     if (turnFilter === 'bloat') {
       return orderedTurns.filter((t) => (t.deltaContextTokens ?? 0) >= 12000);
@@ -466,6 +471,14 @@ export default function SessionDetailPage({
             <article className="kpi-card detail-kpi">
               <div className="kpi-top">
                 <span className="kpi-label">缓存命中与输出速率</span>
+                {(detail.cacheAnomalyCount ?? 0) > 0 && (
+                  <span
+                    className="anomaly-pill"
+                    title={`短间隔异常掉缓存 ${detail.cacheAnomalyCount} 次，估算多花 ${formatUsd(detail.cacheAnomalyWastedUsd)}`}
+                  >
+                    {detail.cacheAnomalyCount} 次掉缓存
+                  </span>
+                )}
               </div>
               <div className="kpi-value-row">
                 <span className="kpi-value accent-speed">{metrics.cacheHitPct.toFixed(1)}%</span>
@@ -568,6 +581,11 @@ export default function SessionDetailPage({
                       压缩 #{hoveredCp.index} ({hoveredCp.reductionPct ?? '-'}%)
                     </span>
                   )}
+                  {hoveredTurn.cacheAnomaly && (
+                    <span className="anomaly-inline-tag">
+                      {getCacheAnomalyLabel(hoveredTurn.cacheAnomaly.kind)} · 间隔 {hoveredTurn.cacheAnomaly.gapSec}s · 命中 {hoveredTurn.cacheAnomaly.prevHitPct}%→{hoveredTurn.cacheAnomaly.curHitPct}%
+                    </span>
+                  )}
                 </>
               ) : (
                 <div className="chart-legend-inline">
@@ -585,6 +603,12 @@ export default function SessionDetailPage({
                         <span className="legend-swatch" style={{ background: '#ef4444', borderRadius: '50%' }} />
                         CHECKPOINT 触发 ({detail.compactionCount} 次)
                       </span>
+                      {(detail.cacheAnomalyCount ?? 0) > 0 && (
+                        <span className="legend-item">
+                          <span className="legend-diamond" />
+                          异常掉缓存 ({detail.cacheAnomalyCount} 次)
+                        </span>
+                      )}
                       <span className="legend-item">
                         <span className="legend-swatch" style={{ background: '#10b981', borderRadius: '50%' }} />
                         压缩后重置基线
@@ -687,6 +711,8 @@ export default function SessionDetailPage({
                       const cacheH = (t.cacheReadTokens / yMaxContext) * plotH;
                       const inputH = Math.max(0, totalH - cacheH);
                       const yBase = PAD_T + plotH;
+                      const hasAnomaly = Boolean(t.cacheAnomaly);
+                      const topY = yBase - totalH;
 
                       return (
                         <g key={`b-${t.stepIndex}-${t.idx}`} opacity={hoverIdx !== null && !isHovered ? 0.72 : 1}>
@@ -700,12 +726,20 @@ export default function SessionDetailPage({
                           />
                           <rect
                             x={x}
-                            y={yBase - totalH}
+                            y={topY}
                             width={barW}
                             height={Math.max(0.8, inputH)}
-                            fill="#1d4ed8"
-                            opacity={0.92}
+                            fill={hasAnomaly ? '#dc2626' : '#1d4ed8'}
+                            opacity={0.94}
                           />
+                          {hasAnomaly && (
+                            <polygon
+                              points={`${cx},${Math.max(PAD_T, topY - 10)} ${cx + 4},${Math.max(PAD_T + 4, topY - 6)} ${cx},${Math.max(PAD_T + 8, topY - 2)} ${cx - 4},${Math.max(PAD_T + 4, topY - 6)}`}
+                              fill="#dc2626"
+                              stroke="#ffffff"
+                              strokeWidth={1.1}
+                            />
+                          )}
                         </g>
                       );
                     }
@@ -915,6 +949,34 @@ export default function SessionDetailPage({
                 ))}
               </div>
             )}
+            {/* Short-Interval Cache Anomaly Quick Jump Strip */}
+            {detail.cacheAnomalies && detail.cacheAnomalies.length > 0 && (
+              <div className="anomaly-strip" role="list" aria-label="短间隔异常掉缓存清单">
+                <span className="anomaly-strip-label">
+                  <AlertTriangle size={12} />
+                  异常掉缓存 ({detail.cacheAnomalies.length} 次 · 估算多花 {formatUsd(detail.cacheAnomalyWastedUsd)})
+                </span>
+                {detail.cacheAnomalies.slice(0, 10).map((an) => (
+                  <button
+                    key={`an-${an.stepIndex}`}
+                    type="button"
+                    role="listitem"
+                    className="anomaly-chip"
+                    onClick={() => jumpToStep(an.stepIndex)}
+                    title={`Step ${an.stepIndex} ${getCacheAnomalyLabel(an.kind)}：距上轮仅 ${an.gapSec}s，命中率 ${an.prevHitPct}% → ${an.curHitPct}%，估算多花 ${formatUsd(an.wastedCostUsd)}`}
+                  >
+                    <span className="anomaly-kind">{getCacheAnomalyLabel(an.kind)}</span>
+                    <span className="mono">Step {an.stepIndex}</span>
+                    <span className="anomaly-meta">
+                      {an.gapSec}s · {an.prevHitPct}%→{an.curHitPct}%
+                    </span>
+                    {an.wastedCostUsd > 0 && (
+                      <span className="anomaly-cost">+{formatUsd(an.wastedCostUsd)}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
             {/* Single-Step Token Bloat Attribution Strip */}
             {detail.heavySteps && detail.heavySteps.length > 0 && (
               <div className="bloat-strip" role="list" aria-label="单步上下文暴涨 Top 归因">
@@ -1032,6 +1094,15 @@ export default function SessionDetailPage({
                       仅压缩节点 ({cpStepSet.size})
                     </button>
                   )}
+                  {(detail.cacheAnomalies?.length ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      className={`seg-btn ${turnFilter === 'anomaly' ? 'active' : ''}`}
+                      onClick={() => setTurnFilter('anomaly')}
+                    >
+                      异常掉缓存 ({detail.cacheAnomalies?.length})
+                    </button>
+                  )}
                   {(detail.heavySteps?.length ?? 0) > 0 && (
                     <button
                       type="button"
@@ -1082,7 +1153,7 @@ export default function SessionDetailPage({
                         ref={(el) => {
                           turnRefs.current[turn.stepIndex] = el;
                         }}
-                        className={`turn-card ${isCpHighlighted ? 'highlighted' : ''}`}
+                        className={`turn-card ${isCpHighlighted ? 'highlighted' : ''} ${turn.cacheAnomaly ? 'cache-anomaly' : ''}`}
                       >
                         <div className="turn-head">
                           <div className="turn-head-left">
@@ -1094,6 +1165,15 @@ export default function SessionDetailPage({
                             <span className="turn-metric-pill">
                               上下文 {formatCompactTokens(turn.contextTokens)}
                             </span>
+                            {turn.cacheAnomaly && (
+                              <span
+                                className="turn-metric-pill anomaly"
+                                title={`短间隔（${turn.cacheAnomaly.gapSec}s）${getCacheAnomalyLabel(turn.cacheAnomaly.kind)}：命中率 ${turn.cacheAnomaly.prevHitPct}% → ${turn.cacheAnomaly.curHitPct}%，估算多花 ${formatUsd(turn.cacheAnomaly.wastedCostUsd)}`}
+                              >
+                                <AlertTriangle size={11} />
+                                {getCacheAnomalyLabel(turn.cacheAnomaly.kind)} · {turn.cacheAnomaly.gapSec}s · {turn.cacheAnomaly.prevHitPct}%→{turn.cacheAnomaly.curHitPct}%
+                              </span>
+                            )}
                             {(turn.deltaContextTokens ?? 0) >= 12000 && (
                               <span
                                 className="turn-metric-pill bloat"

@@ -2,6 +2,7 @@ import {
   loadGuardSettings,
   saveGuardSettings
 } from '../core/plugin-store.mjs';
+import { getQuotaSnapshot } from '../core/quota.mjs';
 import {
   findHeavySteps,
   getContextLimitConfig,
@@ -10,7 +11,6 @@ import {
   getSessionAuditDetail,
   getSessionsList,
   getTodayTotalCostUsd,
-  getWorkspaceBreakdown,
   invalidateMasterIndexCache
 } from '../core/telemetry.mjs';
 
@@ -101,25 +101,6 @@ const TOOLS = [
     }
   },
   {
-    name: 'token_get_workspace_breakdown',
-    description: '按项目（Workspace）维度分摊统计指定时间范围内的会话数、调用次数、总 Token、缓存命中率、估算费用与压缩次数，按费用降序排列。',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        range: {
-          type: 'string',
-          enum: ['today', '7d', '30d', 'all'],
-          description: '时间周期，默认 7d。'
-        },
-        date: {
-          type: 'string',
-          description: '可选，按指定自然日查询，格式 YYYY-MM-DD。'
-        }
-      },
-      additionalProperties: false
-    }
-  },
-  {
     name: 'token_find_heavy_steps',
     description: '扫描指定会话中单步上下文增量（Token 暴涨）最严重的前 N 步，并关联 PostToolUse 记录的工具调用归因（定位是哪个文件读取或命令吃掉了大量上下文）。',
     inputSchema: {
@@ -136,6 +117,20 @@ const TOOLS = [
         top_n: {
           type: 'number',
           description: '返回最多前几步（默认 8，上限 30）。'
+        }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'token_get_quota',
+    description: '只读查询当前本机 Antigravity 账户各模型池（Gemini / Argon / Claude 等）的 5 小时滚动配额与周配额剩余比例及重置倒计时。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        force: {
+          type: 'boolean',
+          description: '是否跳过 45 秒本地缓存强制重新探测（默认 false）。'
         }
       },
       additionalProperties: false
@@ -223,7 +218,11 @@ function resolveDefaultMainSessionId(inputId) {
   return list.sessions[0].conversation_id;
 }
 
-function executeTool(name, args = {}) {
+async function executeTool(name, args = {}) {
+  if (name === 'token_get_quota') {
+    return getQuotaSnapshot({ force: Boolean(args.force) });
+  }
+
   invalidateMasterIndexCache();
 
   if (name === 'token_get_overview') {
@@ -266,15 +265,6 @@ function executeTool(name, args = {}) {
     }
     const weekly = Boolean(args.weekly);
     return getDailyReportData({ date, weekly });
-  }
-
-  if (name === 'token_get_workspace_breakdown') {
-    const range = typeof args.range === 'string' && args.range ? args.range : '7d';
-    const date = typeof args.date === 'string' && args.date.trim() ? args.date.trim() : null;
-    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      throw new Error('date 格式必须为 YYYY-MM-DD');
-    }
-    return getWorkspaceBreakdown({ range, date });
   }
 
   if (name === 'token_find_heavy_steps') {
@@ -349,28 +339,30 @@ function handleRequest(req) {
   if (method === 'tools/call') {
     const toolName = params?.name;
     const toolArgs = params?.arguments && typeof params.arguments === 'object' ? params.arguments : {};
-    try {
-      const payload = executeTool(toolName, toolArgs);
-      sendResult(id, {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(payload, null, 2)
-          }
-        ],
-        isError: false
+    Promise.resolve()
+      .then(() => executeTool(toolName, toolArgs))
+      .then((payload) => {
+        sendResult(id, {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(payload, null, 2)
+            }
+          ],
+          isError: false
+        });
+      })
+      .catch((err) => {
+        sendResult(id, {
+          content: [
+            {
+              type: 'text',
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`
+            }
+          ],
+          isError: true
+        });
       });
-    } catch (err) {
-      sendResult(id, {
-        content: [
-          {
-            type: 'text',
-            text: `Error: ${err instanceof Error ? err.message : String(err)}`
-          }
-        ],
-        isError: true
-      });
-    }
     return;
   }
 

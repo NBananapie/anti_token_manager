@@ -253,6 +253,136 @@ export function computeTurnCostDetails(modelName, inputTokens, cacheReadTokens, 
   return { costUsd, cacheSavingsUsd };
 }
 
+function normalizeModelFamilyForCache(modelLabel = '') {
+  const raw = String(modelLabel || '').trim().toLowerCase();
+  if (!raw || raw === 'unknown') return 'unknown';
+  return raw.replace(/\s*\([^)]*\)\s*$/, '').trim();
+}
+
+/**
+ * Detect short-interval abnormal cache drops within a single session while excluding:
+ * - cold starts (first turn or tiny prompt),
+ * - model family switches,
+ * - post-compaction turns (CHECKPOINT step between previous and current turn),
+ * - natural TTL expiration (gap > maxGapMs, default 180s).
+ */
+export function detectSessionCacheAnomalies(
+  generations = [],
+  checkpoints = [],
+  {
+    maxGapMs = 180_000,
+    minPrevCache = 4_000,
+    minPrevHitPct = 50,
+    minCurContext = 4_000,
+    minMissedContext = 16_000,
+    minKeepRatio = 0.6
+  } = {}
+) {
+  const byIndex = new Map();
+  if (!Array.isArray(generations) || generations.length < 2) {
+    return { byIndex, list: [], count: 0, wastedCostUsd: 0 };
+  }
+
+  const cpSteps = (checkpoints || [])
+    .map(c => c?.stepIndex)
+    .filter(s => typeof s === 'number' && Number.isFinite(s));
+
+  const cachedFamilies = new Set();
+  for (const g of generations) {
+    if ((g?.cacheReadTokens || 0) > 0) {
+      cachedFamilies.add(normalizeModelFamilyForCache(g.model));
+    }
+  }
+
+  const lastByFamily = new Map();
+  const list = [];
+  let wastedCostUsd = 0;
+
+  for (let i = 0; i < generations.length; i++) {
+    const g = generations[i];
+    if (!g) continue;
+    const family = normalizeModelFamilyForCache(g.model);
+    const curIn = g.inputTokens || 0;
+    const curCache = g.cacheReadTokens || 0;
+    const curTotal = curIn + curCache;
+    const curHitPct = curTotal > 0 ? Number(((curCache / curTotal) * 100).toFixed(1)) : null;
+    const prev = lastByFamily.get(family);
+
+    let anomaly = null;
+    if (
+      prev &&
+      curHitPct !== null &&
+      curTotal >= minCurContext &&
+      curTotal >= prev.total * minKeepRatio &&
+      Number.isFinite(g.timestampMs) &&
+      Number.isFinite(prev.timestampMs)
+    ) {
+      const hadCompactionBetween = cpSteps.some(cpStep => cpStep > prev.stepIndex && cpStep < g.stepIndex);
+      const gapMs = g.timestampMs - prev.timestampMs;
+      if (!hadCompactionBetween && gapMs >= 0 && gapMs <= maxGapMs) {
+        let kind = null;
+        if (prev.cache >= minPrevCache && prev.hitPct >= minPrevHitPct) {
+          if (curCache === 0) {
+            kind = 'cleared';
+          } else if (prev.hitPct - curHitPct >= 40 && curHitPct < 20 && curCache < prev.cache * 0.5) {
+            kind = 'dropped';
+          }
+        } else if (
+          curCache === 0 &&
+          cachedFamilies.has(family) &&
+          (prev.anomalous || prev.total >= minMissedContext)
+        ) {
+          kind = 'missed';
+        }
+
+        if (kind) {
+          const pKey = mapModelToPricingKey(g.model);
+          const pricing = PRICING_TABLE[pKey] || FALLBACK_PRICING['gemini-3.8-flash'];
+          const expectedCachedTokens = Math.max(0, Math.min(prev.total, curTotal) - curCache);
+          const extraCost = (expectedCachedTokens / 1e6) * Math.max(0, pricing.input - pricing.cache_read);
+          const roundedExtra = Number(extraCost.toFixed(6));
+          wastedCostUsd += extraCost;
+
+          anomaly = {
+            kind,
+            stepIndex: g.stepIndex,
+            timestampMs: g.timestampMs,
+            model: g.model,
+            gapSec: Number((gapMs / 1000).toFixed(1)),
+            prevStepIndex: prev.stepIndex,
+            prevHitPct: prev.hitPct,
+            curHitPct,
+            prevCacheTokens: prev.cache,
+            curCacheTokens: curCache,
+            contextTokens: curTotal,
+            wastedCostUsd: roundedExtra
+          };
+          byIndex.set(i, anomaly);
+          list.push(anomaly);
+        }
+      }
+    }
+
+    if (curTotal >= 2000 && curHitPct !== null) {
+      lastByFamily.set(family, {
+        stepIndex: g.stepIndex,
+        timestampMs: g.timestampMs,
+        cache: curCache,
+        hitPct: curHitPct,
+        total: curTotal,
+        anomalous: Boolean(anomaly)
+      });
+    }
+  }
+
+  return {
+    byIndex,
+    list,
+    count: list.length,
+    wastedCostUsd: Number(wastedCostUsd.toFixed(4))
+  };
+}
+
 // --- Read-Only Language Server Context Limit Detection (Cached by mtime + disk snapshot) ---
 let cachedContextConfig = null;
 let cachedBinaryMtime = 0;
@@ -774,7 +904,7 @@ const SESSION_CACHE_MAX = 80;
 const SESSION_INFO_CACHE_MAX = 1500;
 const WINDOW_STATS_CACHE_MAX = 12;
 const ROLLUP_CACHE_FILENAME = 'session-rollup-cache-v1.json';
-const ROLLUP_SCHEMA_VERSION = 1;
+const ROLLUP_SCHEMA_VERSION = 2;
 
 const sessionCache = new Map();
 const sessionInfoCache = new Map();
@@ -1351,6 +1481,12 @@ export function getSessionModelStats(conversationId, cacheFullDetail = true) {
 
     const latestModel = generations.length > 0 ? generations[generations.length - 1].model : 'unknown';
     const speed = finalizeSpeedAcc(sessionAcc);
+    const anomalyResult = detectSessionCacheAnomalies(generations, checkpoints);
+    for (const [genIdx, anomaly] of anomalyResult.byIndex.entries()) {
+      if (generations[genIdx]) {
+        generations[genIdx].cacheAnomaly = anomaly;
+      }
+    }
 
     const result = {
       conversationId,
@@ -1367,6 +1503,9 @@ export function getSessionModelStats(conversationId, cacheFullDetail = true) {
       peakContextTokens,
       compactionCount: checkpoints.length,
       checkpoints,
+      cacheAnomalyCount: anomalyResult.count,
+      cacheAnomalyWastedUsd: anomalyResult.wastedCostUsd,
+      cacheAnomalies: anomalyResult.list,
       estimatedCostUsd: Number(estimatedCostUsd.toFixed(4)),
       cacheSavingsUsd: Number(cacheSavingsUsd.toFixed(4)),
       firstTimestampMs: firstTimestampMs || Math.round(stat.mtimeMs),
@@ -1417,6 +1556,8 @@ function buildSessionRollupFromDetail(detail) {
         responseTokens: 0,
         costUsd: 0,
         cacheSavingsUsd: 0,
+        cacheAnomalies: 0,
+        cacheAnomalyWastedUsd: 0,
         firstTs: ts || null,
         lastTs: ts || 0,
         ttftSum: 0,
@@ -1438,6 +1579,10 @@ function buildSessionRollupFromDetail(detail) {
     b.responseTokens += g.responseTokens || 0;
     b.costUsd += g.costUsd || 0;
     b.cacheSavingsUsd += g.cacheSavingsUsd || 0;
+    if (g.cacheAnomaly) {
+      b.cacheAnomalies += 1;
+      b.cacheAnomalyWastedUsd += g.cacheAnomaly.wastedCostUsd || 0;
+    }
     if (ts) {
       if (b.firstTs === null || ts < b.firstTs) b.firstTs = ts;
       if (ts > b.lastTs) b.lastTs = ts;
@@ -1562,6 +1707,8 @@ function buildSessionRollupFromDetail(detail) {
     currentContextTokens: detail.currentContextTokens,
     peakContextTokens: detail.peakContextTokens,
     compactionCount: detail.compactionCount,
+    cacheAnomalyCount: detail.cacheAnomalyCount || 0,
+    cacheAnomalyWastedUsd: detail.cacheAnomalyWastedUsd || 0,
     estimatedCostUsd: detail.estimatedCostUsd,
     cacheSavingsUsd: detail.cacheSavingsUsd,
     firstTimestampMs: detail.firstTimestampMs,
@@ -2179,6 +2326,8 @@ function buildActiveSnapshot(r, childrenByParent) {
     lastCacheReadTokens: s.lastCacheReadTokens || 0,
     peakContextTokens: s.peakContextTokens,
     compactionCount: s.compactionCount,
+    cacheAnomalyCount: s.cacheAnomalyCount || 0,
+    cacheAnomalyWastedUsd: s.cacheAnomalyWastedUsd || 0,
     totalCalls: s.totalCalls,
     estimatedCostUsd: s.estimatedCostUsd,
     cacheSavingsUsd: s.cacheSavingsUsd,
@@ -2268,6 +2417,8 @@ export function computeWindowStats(
   let totalEstimatedCostUsd = 0;
   let totalCacheSavingsUsd = 0;
   let totalCompactions = 0;
+  let totalCacheAnomalies = 0;
+  let totalCacheAnomalyWastedUsd = 0;
   let windowMinTs = null;
   let windowMaxTs = null;
 
@@ -2307,6 +2458,8 @@ export function computeWindowStats(
           currentContextTokens: 0,
           peakContextTokens: 0,
           compactionCount: 0,
+          cacheAnomalyCount: 0,
+          cacheAnomalyWastedUsd: 0,
           estimatedCostUsd: 0,
           cacheSavingsUsd: 0,
           avgTtftSec: null,
@@ -2321,6 +2474,7 @@ export function computeWindowStats(
     const sessModelCounts = {};
     const sessSpeedAcc = createSpeedAcc();
     let sIn = 0, sCache = 0, sOut = 0, sThink = 0, sResp = 0, sCost = 0, sSave = 0;
+    let sCacheAnom = 0, sCacheAnomWasted = 0;
     let sLastTs = 0;
     let sTurns = 0;
     let cpCount = 0;
@@ -2339,6 +2493,8 @@ export function computeWindowStats(
       sResp += b.responseTokens;
       sCost += b.costUsd;
       sSave += b.cacheSavingsUsd;
+      sCacheAnom += b.cacheAnomalies || 0;
+      sCacheAnomWasted += b.cacheAnomalyWastedUsd || 0;
       sTurns += b.calls;
       sessModelCounts[b.model] = (sessModelCounts[b.model] || 0) + b.calls;
       addSpeedBucket(sessSpeedAcc, b);
@@ -2436,6 +2592,8 @@ export function computeWindowStats(
     totalEstimatedCostUsd += sCost;
     totalCacheSavingsUsd += sSave;
     totalCompactions += cpCount;
+    totalCacheAnomalies += sCacheAnom;
+    totalCacheAnomalyWastedUsd += sCacheAnomWasted;
     typeCounts[rec.resolved.sessionType] = (typeCounts[rec.resolved.sessionType] || 0) + 1;
 
     const sSpeed = finalizeSpeedAcc(sessSpeedAcc);
@@ -2465,6 +2623,8 @@ export function computeWindowStats(
       currentContextTokens: d.currentContextTokens,
       peakContextTokens: d.peakContextTokens,
       compactionCount: d.compactionCount,
+      cacheAnomalyCount: sCacheAnom,
+      cacheAnomalyWastedUsd: Number(sCacheAnomWasted.toFixed(4)),
       estimatedCostUsd: Number(sCost.toFixed(4)),
       cacheSavingsUsd: Number(sSave.toFixed(4)),
       avgTtftSec: sSpeed.avgTtftSec,
@@ -2534,6 +2694,8 @@ export function computeWindowStats(
     totalCacheSavingsUsd: Number(totalCacheSavingsUsd.toFixed(2)),
     cacheSavingsPct,
     totalCompactions,
+    totalCacheAnomalies,
+    totalCacheAnomalyWastedUsd: Number(totalCacheAnomalyWastedUsd.toFixed(4)),
     globalSpeed,
     typeCounts,
     modelTotals,

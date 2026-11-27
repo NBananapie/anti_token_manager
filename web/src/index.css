@@ -3385,3 +3385,328 @@ input:focus-visible,
 .app-shell.compact-mode .workspace-grid {
   grid-template-columns: 1fr;
 }
+
+/* ============================================================
+   Read-Only Local Account Quota Panel (5h / Weekly)
+   ============================================================ */
+.quota-panel {
+  padding: 14px 16px;
+}
+
+.quota-panel.compact {
+  padding: 12px 13px;
+}
+
+.quota-panel.offline {
+  padding: 9px 14px;
+}
+
+.quota-offline-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.quota-offline-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.quota-refresh-btn {
+  height: 26px;
+  padding: 0 9px;
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+.quota-plan-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+.quota-stale-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(245, 158, 11, 0.14);
+  color: light-dark(#b45309, #fcd34d);
+}
+
+.quota-groups-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.quota-panel.compact .quota-groups-grid {
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.quota-group-card {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+
+.quota-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.quota-group-name-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.quota-group-name {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.quota-group-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+
+.quota-windows-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.quota-win-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.quota-win-row.unavailable {
+  opacity: 0.62;
+}
+
+.quota-win-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.quota-win-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.quota-win-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quota-win-reset {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.quota-win-pct {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.quota-win-pct.ok {
+  color: light-dark(#047857, #34d399);
+}
+
+.quota-win-pct.warn {
+  color: light-dark(#b45309, #fbbf24);
+}
+
+.quota-win-pct.danger {
+  color: light-dark(#b91c1c, #f87171);
+}
+
+.quota-bar-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.quota-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.quota-bar-fill.ok {
+  background: light-dark(#10b981, #34d399);
+}
+
+.quota-bar-fill.warn {
+  background: light-dark(#d97706, #fbbf24);
+}
+
+.quota-bar-fill.danger {
+  background: light-dark(#dc2626, #f87171);
+}
+
+/* ============================================================
+   Short-Interval Cache Anomaly Highlighting (Red Badges & Cards)
+   ============================================================ */
+.anomaly-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--offline-bg);
+  color: var(--offline-text);
+  border: 1px solid var(--offline-border);
+  white-space: nowrap;
+}
+
+.anomaly-mini-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--offline-bg);
+  color: var(--offline-text);
+  border: 1px solid var(--offline-border);
+  white-space: nowrap;
+}
+
+.anomaly-inline-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--offline-bg);
+  color: var(--offline-text);
+  border: 1px solid var(--offline-border);
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.legend-diamond {
+  width: 7px;
+  height: 7px;
+  background: #dc2626;
+  transform: rotate(45deg);
+  display: inline-block;
+}
+
+.anomaly-strip {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.anomaly-strip-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--offline-text);
+  margin-right: 4px;
+}
+
+.anomaly-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--offline-border);
+  background: var(--offline-bg);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 0.14s ease, filter 0.14s ease;
+}
+
+.anomaly-chip:hover {
+  border-color: #ef4444;
+  filter: brightness(0.98);
+}
+
+.anomaly-kind {
+  font-weight: 700;
+  color: var(--offline-text);
+}
+
+.anomaly-meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.anomaly-cost {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--offline-text);
+}
+
+.turn-card.cache-anomaly {
+  border-color: var(--offline-border);
+  box-shadow: inset 3px 0 0 #dc2626;
+}
+
+.turn-metric-pill.anomaly {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--offline-bg);
+  color: var(--offline-text);
+  border: 1px solid var(--offline-border);
+  font-weight: 700;
+}

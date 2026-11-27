@@ -6,6 +6,7 @@ import {
   loadGuardSettings,
   saveGuardSettings
 } from '../core/plugin-store.mjs';
+import { getQuotaSnapshot } from '../core/quota.mjs';
 import {
   BASE_DIR,
   CONVERSATIONS_DIR,
@@ -347,6 +348,26 @@ const server = http.createServer((req, res) => {
     req.on('close', () => {
       sseClients.delete(res);
     });
+    return;
+  }
+
+  // API: Read-only Local Account Quota (5h rolling & weekly pools)
+  if (pathname === '/api/quota') {
+    const force = urlObj.searchParams.get('force') === '1' || urlObj.searchParams.get('force') === 'true';
+    getQuotaSnapshot({ force })
+      .then((snapshot) => sendJson(res, 200, snapshot))
+      .catch((err) => {
+        sendJson(res, 200, {
+          available: false,
+          status: 'offline',
+          source: 'none',
+          lsVersion: null,
+          planName: null,
+          groups: [],
+          fetchedAt: null,
+          error: err instanceof Error ? err.message : 'Quota probe failed'
+        });
+      });
     return;
   }
 

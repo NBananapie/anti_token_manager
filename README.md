@@ -239,7 +239,7 @@ npm run plugin:uninstall
 
 安装完成后，插件随 Antigravity 自动发现：
 - **右侧辅助面板（Sidecar UI）**：自动随插件启停，默认锁定当前对话上下文水位、剩余压缩安全空间与锯齿波形；支持按项目（Workspace）分摊成本与一键过滤当前工作区、一键跳转原对话、单步 Token 暴涨归因胶囊以及可视化守卫预算设置抽屉。
-- **内置 8 个原生 MCP 工具**：`token_get_overview`、`token_get_session_audit`、`token_get_context_limit`、`token_get_daily_report`、`token_get_workspace_breakdown`、`token_find_heavy_steps`、`token_get_guard_settings`、`token_set_guard_config`。
+- **内置 8 个原生 MCP 工具**：`token_get_overview`、`token_get_session_audit`、`token_get_context_limit`、`token_get_daily_report`、`token_find_heavy_steps`、`token_get_quota`、`token_get_guard_settings`、`token_set_guard_config`。
 - **全生命周期守卫 Hooks**：
   - `SessionStart`：自动巡检 Antigravity 热更新是否将 `language_server` 上限覆盖回 `256K`；
   - `PostToolUse`：轻量记录工具调用归因，在锯齿波形详情页标出单步上下文暴涨元凶；
